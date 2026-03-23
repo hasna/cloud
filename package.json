@@ -1,6 +1,6 @@
 {
   "name": "@hasna/cloud",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Shared cloud infrastructure — database adapter (SQLite + PostgreSQL), sync engine, feedback system, unified dotfile config",
   "license": "Apache-2.0",
   "type": "module",

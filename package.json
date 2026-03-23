@@ -1,7 +1,7 @@
 {
   "name": "@hasna/cloud",
   "version": "0.1.2",
-  "description": "Shared cloud infrastructure — database adapter (SQLite + PostgreSQL), sync engine, feedback system, unified dotfile config",
+  "description": "Shared cloud infrastructure \u2014 database adapter (SQLite + PostgreSQL), sync engine, feedback system, unified dotfile config",
   "license": "Apache-2.0",
   "type": "module",
   "main": "dist/index.js",
@@ -24,7 +24,8 @@
     "build": "bun build src/index.ts --outdir dist --target node && bun build src/cli/index.ts --outdir dist/cli --target node && bun build src/mcp/index.ts --outdir dist/mcp --target node && bun run build:types",
     "build:types": "tsc --emitDeclarationOnly --declaration --outDir dist",
     "test": "bun test",
-    "prepublishOnly": "bun run build"
+    "prepublishOnly": "bun run build",
+    "postinstall": "mkdir -p $HOME/.hasna/cloud 2>/dev/null || true"
   },
   "publishConfig": {
     "registry": "https://registry.npmjs.org",

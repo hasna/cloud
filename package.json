@@ -25,7 +25,7 @@
     "build:types": "tsc --emitDeclarationOnly --declaration --outDir dist",
     "test": "bun test",
     "prepublishOnly": "bun run build",
-    "postinstall": "mkdir -p $HOME/.hasna/cloud 2>/dev/null || true"
+    "postinstall": "mkdir -p $HOME/.hasna/cloud 2>/dev/null || true; test -f $HOME/.hasna/cloud/config.json || printf '{\"rds\":{\"host\":\"hasnaxyz-prod-opensource.c4limg0qgqvk.us-east-1.rds.amazonaws.com\",\"port\":5432,\"username\":\"\",\"password_env\":\"HASNA_RDS_PASSWORD\",\"ssl\":true},\"mode\":\"local\",\"feedback_endpoint\":\"https://feedback.hasna.com/api/v1/feedback\",\"auto_sync_interval_minutes\":0}\\n' > $HOME/.hasna/cloud/config.json 2>/dev/null || true"
   },
   "publishConfig": {
     "registry": "https://registry.npmjs.org",

@@ -1,0 +1,44 @@
+{
+  "name": "@hasna/cloud",
+  "version": "0.1.0",
+  "description": "Shared cloud infrastructure — database adapter (SQLite + PostgreSQL), sync engine, feedback system, unified dotfile config",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "cloud": "dist/cli/index.js",
+    "cloud-mcp": "dist/mcp/index.js"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target node && bun build src/cli/index.ts --outdir dist/cli --target node && bun build src/mcp/index.ts --outdir dist/mcp --target node && bun run build:types",
+    "build:types": "tsc --emitDeclarationOnly --declaration --outDir dist",
+    "test": "bun test",
+    "prepublishOnly": "bun run build"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org",
+    "access": "public"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "commander": "^13.1.0",
+    "pg": "^8.13.3",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.6",
+    "@types/pg": "^8.11.11",
+    "typescript": "^5.7.3"
+  }
+}

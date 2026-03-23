@@ -1,0 +1,304 @@
+#!/usr/bin/env bun
+import { Command } from "commander";
+import {
+  getCloudConfig,
+  saveCloudConfig,
+  getConnectionString,
+  createDatabase,
+  type CloudConfig,
+} from "../config.js";
+import { syncPush, syncPull, listSqliteTables } from "../sync.js";
+import { saveFeedback, sendFeedback } from "../feedback.js";
+import { migrateDotfile, getDataDir, getDbPath } from "../dotfile.js";
+import { SqliteAdapter, PgAdapter } from "../adapter.js";
+import { readFileSync } from "fs";
+import { join, dirname } from "path";
+
+const program = new Command();
+
+program
+  .name("cloud")
+  .description(
+    "Shared cloud infrastructure — database adapter, sync engine, feedback, dotfile migration"
+  )
+  .version("0.1.0");
+
+// ---------------------------------------------------------------------------
+// cloud setup
+// ---------------------------------------------------------------------------
+
+program
+  .command("setup")
+  .description("Configure cloud settings")
+  .option("--host <host>", "RDS hostname")
+  .option("--port <port>", "RDS port", "5432")
+  .option("--username <user>", "RDS username")
+  .option("--password-env <env>", "Env var for RDS password", "HASNA_RDS_PASSWORD")
+  .option("--ssl", "Enable SSL", true)
+  .option("--no-ssl", "Disable SSL")
+  .option("--mode <mode>", "Mode: local, cloud, or hybrid", "local")
+  .option("--sync-interval <minutes>", "Auto-sync interval in minutes", "0")
+  .action((opts) => {
+    const config = getCloudConfig();
+
+    if (opts.host) config.rds.host = opts.host;
+    if (opts.port) config.rds.port = parseInt(opts.port, 10);
+    if (opts.username) config.rds.username = opts.username;
+    if (opts.passwordEnv) config.rds.password_env = opts.passwordEnv;
+    config.rds.ssl = opts.ssl;
+    if (opts.mode) config.mode = opts.mode as CloudConfig["mode"];
+    if (opts.syncInterval)
+      config.auto_sync_interval_minutes = parseInt(opts.syncInterval, 10);
+
+    saveCloudConfig(config);
+    console.log("Cloud configuration saved.");
+    console.log(JSON.stringify(config, null, 2));
+  });
+
+// ---------------------------------------------------------------------------
+// cloud status
+// ---------------------------------------------------------------------------
+
+program
+  .command("status")
+  .description("Show current cloud configuration and connection health")
+  .action(async () => {
+    const config = getCloudConfig();
+    console.log("Mode:", config.mode);
+    console.log("RDS Host:", config.rds.host || "(not configured)");
+    console.log("RDS Port:", config.rds.port);
+    console.log("RDS Username:", config.rds.username || "(not configured)");
+    console.log("SSL:", config.rds.ssl);
+    console.log(
+      "Auto-sync interval:",
+      config.auto_sync_interval_minutes
+        ? `${config.auto_sync_interval_minutes} minutes`
+        : "disabled"
+    );
+
+    // Check PG connection if configured
+    if (config.rds.host && config.rds.username) {
+      console.log("\nChecking PostgreSQL connection...");
+      try {
+        const connStr = getConnectionString("postgres");
+        const pg = new PgAdapter(connStr);
+        const row = pg.get("SELECT 1 as ok");
+        if (row?.ok === 1) {
+          console.log("PostgreSQL: connected");
+        }
+        pg.close();
+      } catch (err: any) {
+        console.log("PostgreSQL: connection failed —", err?.message);
+      }
+    }
+  });
+
+// ---------------------------------------------------------------------------
+// cloud sync push
+// ---------------------------------------------------------------------------
+
+const syncCmd = program.command("sync").description("Sync data between local and cloud");
+
+syncCmd
+  .command("push")
+  .description("Push local data to cloud")
+  .requiredOption("--service <name>", "Service name")
+  .option("--tables <tables>", "Comma-separated table names (default: all)")
+  .action((opts) => {
+    const config = getCloudConfig();
+    if (config.mode === "local") {
+      console.error(
+        "Error: mode is 'local'. Run `cloud setup --mode hybrid` or `--mode cloud` first."
+      );
+      process.exit(1);
+    }
+
+    const dbPath = getDbPath(opts.service);
+    const local = new SqliteAdapter(dbPath);
+
+    let tables: string[];
+    if (opts.tables) {
+      tables = opts.tables.split(",").map((t: string) => t.trim());
+    } else {
+      tables = listSqliteTables(local);
+    }
+
+    if (tables.length === 0) {
+      console.log("No tables found to sync.");
+      local.close();
+      return;
+    }
+
+    console.log(`Pushing ${tables.length} table(s) to cloud...`);
+
+    const connStr = getConnectionString(opts.service);
+    const cloud = new PgAdapter(connStr);
+
+    const results = syncPush(local, cloud, {
+      tables,
+      onProgress: (p) => {
+        if (p.phase === "done") {
+          console.log(
+            `  [${p.currentTableIndex + 1}/${p.totalTables}] ${p.table}: ${p.rowsWritten} rows synced`
+          );
+        }
+      },
+    });
+
+    local.close();
+    cloud.close();
+
+    const totalWritten = results.reduce((s, r) => s + r.rowsWritten, 0);
+    const totalErrors = results.reduce((s, r) => s + r.errors.length, 0);
+    console.log(`\nDone. ${totalWritten} rows pushed, ${totalErrors} errors.`);
+
+    if (totalErrors > 0) {
+      for (const r of results) {
+        for (const e of r.errors) {
+          console.error(`  ${r.table}: ${e}`);
+        }
+      }
+    }
+  });
+
+// ---------------------------------------------------------------------------
+// cloud sync pull
+// ---------------------------------------------------------------------------
+
+syncCmd
+  .command("pull")
+  .description("Pull cloud data to local")
+  .requiredOption("--service <name>", "Service name")
+  .option("--tables <tables>", "Comma-separated table names (default: all)")
+  .action((opts) => {
+    const config = getCloudConfig();
+    if (config.mode === "local") {
+      console.error(
+        "Error: mode is 'local'. Run `cloud setup --mode hybrid` or `--mode cloud` first."
+      );
+      process.exit(1);
+    }
+
+    const dbPath = getDbPath(opts.service);
+    const local = new SqliteAdapter(dbPath);
+
+    const connStr = getConnectionString(opts.service);
+    const cloud = new PgAdapter(connStr);
+
+    let tables: string[];
+    if (opts.tables) {
+      tables = opts.tables.split(",").map((t: string) => t.trim());
+    } else {
+      // For pull, list PG tables
+      try {
+        const rows = cloud.all(
+          `SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename`
+        );
+        tables = rows.map((r: any) => r.tablename);
+      } catch {
+        console.error("Failed to list tables from cloud.");
+        local.close();
+        cloud.close();
+        process.exit(1);
+        return;
+      }
+    }
+
+    if (tables.length === 0) {
+      console.log("No tables found to sync.");
+      local.close();
+      cloud.close();
+      return;
+    }
+
+    console.log(`Pulling ${tables.length} table(s) from cloud...`);
+
+    const results = syncPull(local, cloud, {
+      tables,
+      onProgress: (p) => {
+        if (p.phase === "done") {
+          console.log(
+            `  [${p.currentTableIndex + 1}/${p.totalTables}] ${p.table}: ${p.rowsWritten} rows synced`
+          );
+        }
+      },
+    });
+
+    local.close();
+    cloud.close();
+
+    const totalWritten = results.reduce((s, r) => s + r.rowsWritten, 0);
+    const totalErrors = results.reduce((s, r) => s + r.errors.length, 0);
+    console.log(`\nDone. ${totalWritten} rows pulled, ${totalErrors} errors.`);
+
+    if (totalErrors > 0) {
+      for (const r of results) {
+        for (const e of r.errors) {
+          console.error(`  ${r.table}: ${e}`);
+        }
+      }
+    }
+  });
+
+// ---------------------------------------------------------------------------
+// cloud feedback send
+// ---------------------------------------------------------------------------
+
+program
+  .command("feedback")
+  .description("Send feedback")
+  .requiredOption("--service <name>", "Service name")
+  .requiredOption("--message <msg>", "Feedback message")
+  .option("--email <email>", "Contact email")
+  .option("--version <ver>", "Service version")
+  .action(async (opts) => {
+    const db = createDatabase({ service: "cloud" });
+
+    const result = await sendFeedback(
+      {
+        service: opts.service,
+        version: opts.version,
+        message: opts.message,
+        email: opts.email,
+      },
+      db
+    );
+
+    if (result.sent) {
+      console.log(`Feedback sent successfully (id: ${result.id})`);
+    } else {
+      console.log(
+        `Feedback saved locally (id: ${result.id}). Remote send failed: ${result.error}`
+      );
+    }
+
+    db.close();
+  });
+
+// ---------------------------------------------------------------------------
+// cloud migrate
+// ---------------------------------------------------------------------------
+
+program
+  .command("migrate")
+  .description("Migrate legacy dotfiles to ~/.hasna/")
+  .argument("<service>", "Service name to migrate")
+  .action((service) => {
+    const migrated = migrateDotfile(service);
+    if (migrated.length === 0) {
+      console.log(
+        `No migration needed for "${service}" — either no legacy dir or already migrated.`
+      );
+    } else {
+      console.log(`Migrated ${migrated.length} file(s) from ~/.${service}/ to ~/.hasna/${service}/:`);
+      for (const f of migrated) {
+        console.log(`  ${f}`);
+      }
+    }
+  });
+
+// ---------------------------------------------------------------------------
+// Run
+// ---------------------------------------------------------------------------
+
+program.parse();

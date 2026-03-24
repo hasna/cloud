@@ -64,6 +64,11 @@ export class SqliteAdapter implements DbAdapter {
     this.db.exec(sql);
   }
 
+  /** Passthrough to bun:sqlite's .query() for compatibility with code that uses db.query() */
+  query(sql: string) {
+    return this.db.query(sql);
+  }
+
   prepare(sql: string): PreparedStatement {
     const stmt = this.db.prepare(sql);
     return {

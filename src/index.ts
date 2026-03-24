@@ -63,6 +63,54 @@ export {
   getHasnaDir,
 } from "./dotfile.js";
 
+// Sync progress tracking & resumability
+export {
+  SyncProgressTracker,
+  type SyncProgressInfo,
+  type ProgressCallback,
+  type ResumePoint,
+} from "./sync-progress.js";
+
+// Sync conflict resolution
+export {
+  detectConflicts,
+  resolveConflicts,
+  getWinningData,
+  ensureConflictsTable,
+  storeConflicts,
+  listConflicts,
+  resolveConflict,
+  getConflict,
+  purgeResolvedConflicts,
+  type SyncConflict,
+  type ConflictStrategy,
+  type StoredConflict,
+} from "./sync-conflicts.js";
+
+// Incremental sync (change tracking)
+export {
+  incrementalSyncPush,
+  incrementalSyncPull,
+  ensureSyncMetaTable,
+  getSyncMetaAll,
+  getSyncMetaForTable,
+  resetSyncMeta,
+  resetAllSyncMeta,
+  type IncrementalSyncStats,
+  type IncrementalSyncOptions,
+  type SyncMeta,
+} from "./sync-incremental.js";
+
+// Auto-sync on start/stop
+export {
+  setupAutoSync,
+  enableAutoSync,
+  getAutoSyncConfig,
+  type AutoSyncConfig,
+  type AutoSyncContext,
+  type AutoSyncResult,
+} from "./auto-sync.js";
+
 // Integration helpers (for services to embed cloud features)
 export { registerCloudTools } from "./mcp-helpers.js";
 export { registerCloudCommands } from "./cli-helpers.js";

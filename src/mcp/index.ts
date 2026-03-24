@@ -7,10 +7,10 @@ import {
   getConnectionString,
   createDatabase,
 } from "../config.js";
-import { syncPush, syncPull, listSqliteTables } from "../sync.js";
+import { syncPush, syncPull, listSqliteTables, listPgTables } from "../sync.js";
 import { sendFeedback } from "../feedback.js";
 import { getDbPath } from "../dotfile.js";
-import { SqliteAdapter, PgAdapter } from "../adapter.js";
+import { SqliteAdapter, PgAdapterAsync } from "../adapter.js";
 
 // ---------------------------------------------------------------------------
 // Server setup
@@ -40,10 +40,10 @@ server.tool("cloud_status", "Show cloud configuration and connection health", {}
   if (config.rds.host && config.rds.username) {
     try {
       const connStr = getConnectionString("postgres");
-      const pg = new PgAdapter(connStr);
-      pg.get("SELECT 1 as ok");
+      const pg = new PgAdapterAsync(connStr);
+      await pg.get("SELECT 1 as ok");
       lines.push("PostgreSQL: connected");
-      pg.close();
+      await pg.close();
     } catch (err: any) {
       lines.push(`PostgreSQL: connection failed — ${err?.message}`);
     }
@@ -83,7 +83,7 @@ server.tool(
     const dbPath = getDbPath(service);
     const local = new SqliteAdapter(dbPath);
     const connStr = getConnectionString(service);
-    const cloud = new PgAdapter(connStr);
+    const cloud = new PgAdapterAsync(connStr);
 
     let tableList: string[];
     if (tablesStr) {
@@ -92,10 +92,10 @@ server.tool(
       tableList = listSqliteTables(local);
     }
 
-    const results = syncPush(local, cloud, { tables: tableList });
+    const results = await syncPush(local, cloud, { tables: tableList });
 
     local.close();
-    cloud.close();
+    await cloud.close();
 
     const totalWritten = results.reduce((s, r) => s + r.rowsWritten, 0);
     const totalErrors = results.reduce((s, r) => s + r.errors.length, 0);
@@ -146,20 +146,17 @@ server.tool(
     const dbPath = getDbPath(service);
     const local = new SqliteAdapter(dbPath);
     const connStr = getConnectionString(service);
-    const cloud = new PgAdapter(connStr);
+    const cloud = new PgAdapterAsync(connStr);
 
     let tableList: string[];
     if (tablesStr) {
       tableList = tablesStr.split(",").map((t) => t.trim());
     } else {
       try {
-        const rows = cloud.all(
-          `SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename`
-        );
-        tableList = rows.map((r: any) => r.tablename);
+        tableList = await listPgTables(cloud);
       } catch {
         local.close();
-        cloud.close();
+        await cloud.close();
         return {
           content: [
             { type: "text", text: "Error: failed to list tables from cloud." },
@@ -169,10 +166,10 @@ server.tool(
       }
     }
 
-    const results = syncPull(local, cloud, { tables: tableList });
+    const results = await syncPull(cloud, local, { tables: tableList });
 
     local.close();
-    cloud.close();
+    await cloud.close();
 
     const totalWritten = results.reduce((s, r) => s + r.rowsWritten, 0);
     const totalErrors = results.reduce((s, r) => s + r.errors.length, 0);

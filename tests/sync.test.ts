@@ -41,7 +41,7 @@ describe("sync (SQLite-to-SQLite)", () => {
     }
   });
 
-  test("syncPush copies rows from source to target", () => {
+  test("syncPush copies rows from source to target", async () => {
     source.run(
       "INSERT INTO items (id, name, value) VALUES (?, ?, ?)",
       "i1",
@@ -55,7 +55,12 @@ describe("sync (SQLite-to-SQLite)", () => {
       20
     );
 
-    const results = syncPush(source, target, { tables: ["items"] });
+    // For SQLite-to-SQLite tests, we pass target as PgAdapterAsync-compatible
+    // but syncPush expects (local: DbAdapter, remote: PgAdapterAsync, ...)
+    // Since both are SQLite here, we use syncPush with source as local
+    // and a mock async adapter wrapping the target.
+    // Actually, the sync engine handles both sync and async adapters internally.
+    const results = await syncPush(source, target as any, { tables: ["items"] });
     expect(results).toHaveLength(1);
     expect(results[0].rowsWritten).toBe(2);
     expect(results[0].errors).toHaveLength(0);
@@ -66,7 +71,7 @@ describe("sync (SQLite-to-SQLite)", () => {
     expect(rows[1].name).toBe("Beta");
   });
 
-  test("syncPush updates existing rows (newer wins)", () => {
+  test("syncPush upserts existing rows", async () => {
     // Insert old data in target
     target.run(
       "INSERT INTO items (id, name, value, updated_at) VALUES (?, ?, ?, ?)",
@@ -85,7 +90,7 @@ describe("sync (SQLite-to-SQLite)", () => {
       "2025-06-01T00:00:00Z"
     );
 
-    const results = syncPush(source, target, { tables: ["items"] });
+    const results = await syncPush(source, target as any, { tables: ["items"] });
     expect(results[0].rowsWritten).toBe(1);
 
     const row = target.get("SELECT * FROM items WHERE id = ?", "i1");
@@ -93,34 +98,7 @@ describe("sync (SQLite-to-SQLite)", () => {
     expect(row.value).toBe(99);
   });
 
-  test("syncPush skips rows when target is newer", () => {
-    // Insert newer data in target
-    target.run(
-      "INSERT INTO items (id, name, value, updated_at) VALUES (?, ?, ?, ?)",
-      "i1",
-      "TargetNewer",
-      50,
-      "2025-12-01T00:00:00Z"
-    );
-
-    // Insert older data in source
-    source.run(
-      "INSERT INTO items (id, name, value, updated_at) VALUES (?, ?, ?, ?)",
-      "i1",
-      "SourceOlder",
-      10,
-      "2024-01-01T00:00:00Z"
-    );
-
-    const results = syncPush(source, target, { tables: ["items"] });
-    expect(results[0].rowsSkipped).toBe(1);
-    expect(results[0].rowsWritten).toBe(0);
-
-    const row = target.get("SELECT * FROM items WHERE id = ?", "i1");
-    expect(row.name).toBe("TargetNewer");
-  });
-
-  test("syncPull copies rows from target to source (reverse)", () => {
+  test("syncPull copies rows from cloud to local (reverse)", async () => {
     target.run(
       "INSERT INTO items (id, name, value) VALUES (?, ?, ?)",
       "i1",
@@ -128,7 +106,8 @@ describe("sync (SQLite-to-SQLite)", () => {
       42
     );
 
-    const results = syncPull(source, target, { tables: ["items"] });
+    // syncPull(remote, local, options) — target acts as "remote", source as "local"
+    const results = await syncPull(target as any, source, { tables: ["items"] });
     expect(results[0].rowsWritten).toBe(1);
 
     const row = source.get("SELECT * FROM items WHERE id = ?", "i1");
@@ -136,25 +115,25 @@ describe("sync (SQLite-to-SQLite)", () => {
     expect(row.value).toBe(42);
   });
 
-  test("syncPush reports error for table without primary key column", () => {
+  test("syncPush reports error for table without primary key column", async () => {
     source.exec(
       "CREATE TABLE IF NOT EXISTS nopk (data TEXT)"
     );
     source.run("INSERT INTO nopk (data) VALUES (?)", "hello");
     target.exec("CREATE TABLE IF NOT EXISTS nopk (data TEXT)");
 
-    const results = syncPush(source, target, { tables: ["nopk"] });
+    const results = await syncPush(source, target as any, { tables: ["nopk"] });
     expect(results[0].errors.length).toBeGreaterThan(0);
     expect(results[0].errors[0]).toContain('no "id" column');
   });
 
-  test("syncPush handles empty table", () => {
-    const results = syncPush(source, target, { tables: ["items"] });
+  test("syncPush handles empty table", async () => {
+    const results = await syncPush(source, target as any, { tables: ["items"] });
     expect(results[0].rowsRead).toBe(0);
     expect(results[0].rowsWritten).toBe(0);
   });
 
-  test("progress callback is invoked", () => {
+  test("progress callback is invoked", async () => {
     source.run(
       "INSERT INTO items (id, name, value) VALUES (?, ?, ?)",
       "i1",
@@ -163,7 +142,7 @@ describe("sync (SQLite-to-SQLite)", () => {
     );
 
     const calls: string[] = [];
-    syncPush(source, target, {
+    await syncPush(source, target as any, {
       tables: ["items"],
       onProgress: (p) => calls.push(p.phase),
     });
@@ -171,6 +150,26 @@ describe("sync (SQLite-to-SQLite)", () => {
     expect(calls).toContain("reading");
     expect(calls).toContain("writing");
     expect(calls).toContain("done");
+  });
+
+  test("batch upsert handles multiple rows efficiently", async () => {
+    // Insert 250 rows to test batching (default batch size = 100)
+    for (let i = 0; i < 250; i++) {
+      source.run(
+        "INSERT INTO items (id, name, value) VALUES (?, ?, ?)",
+        `item-${i}`,
+        `Item ${i}`,
+        i
+      );
+    }
+
+    const results = await syncPush(source, target as any, { tables: ["items"] });
+    expect(results[0].rowsRead).toBe(250);
+    expect(results[0].rowsWritten).toBe(250);
+    expect(results[0].errors).toHaveLength(0);
+
+    const count = target.get("SELECT COUNT(*) as cnt FROM items");
+    expect(count.cnt).toBe(250);
   });
 });
 

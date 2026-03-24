@@ -4,10 +4,10 @@ import {
   getConnectionString,
   createDatabase,
 } from "./config.js";
-import { syncPush, syncPull, listSqliteTables } from "./sync.js";
+import { syncPush, syncPull, listSqliteTables, listPgTables } from "./sync.js";
 import { sendFeedback } from "./feedback.js";
 import { getDbPath } from "./dotfile.js";
-import { SqliteAdapter, PgAdapter } from "./adapter.js";
+import { SqliteAdapter, PgAdapterAsync } from "./adapter.js";
 
 /**
  * Register cloud-related subcommands onto an existing Commander program.
@@ -43,10 +43,10 @@ export function registerCloudCommands(
       if (config.rds.host && config.rds.username) {
         try {
           const connStr = getConnectionString("postgres");
-          const pg = new PgAdapter(connStr);
-          pg.get("SELECT 1 as ok");
+          const pg = new PgAdapterAsync(connStr);
+          await pg.get("SELECT 1 as ok");
           console.log("PostgreSQL: connected");
-          pg.close();
+          await pg.close();
         } catch (err: any) {
           console.log("PostgreSQL: connection failed —", err?.message);
         }
@@ -57,7 +57,7 @@ export function registerCloudCommands(
     .command("push")
     .description("Push local data to cloud")
     .option("--tables <tables>", "Comma-separated table names")
-    .action((opts) => {
+    .action(async (opts) => {
       const config = getCloudConfig();
       if (config.mode === "local") {
         console.error("Error: mode is 'local'. Run `cloud setup` first.");
@@ -65,13 +65,13 @@ export function registerCloudCommands(
       }
 
       const local = new SqliteAdapter(getDbPath(serviceName));
-      const cloud = new PgAdapter(getConnectionString(serviceName));
+      const cloud = new PgAdapterAsync(getConnectionString(serviceName));
 
       const tables = opts.tables
         ? opts.tables.split(",").map((t: string) => t.trim())
         : listSqliteTables(local);
 
-      const results = syncPush(local, cloud, {
+      const results = await syncPush(local, cloud, {
         tables,
         onProgress: (p) => {
           if (p.phase === "done") {
@@ -81,7 +81,7 @@ export function registerCloudCommands(
       });
 
       local.close();
-      cloud.close();
+      await cloud.close();
 
       const total = results.reduce((s, r) => s + r.rowsWritten, 0);
       console.log(`Done. ${total} rows pushed.`);
@@ -91,7 +91,7 @@ export function registerCloudCommands(
     .command("pull")
     .description("Pull cloud data to local")
     .option("--tables <tables>", "Comma-separated table names")
-    .action((opts) => {
+    .action(async (opts) => {
       const config = getCloudConfig();
       if (config.mode === "local") {
         console.error("Error: mode is 'local'. Run `cloud setup` first.");
@@ -99,19 +99,16 @@ export function registerCloudCommands(
       }
 
       const local = new SqliteAdapter(getDbPath(serviceName));
-      const cloud = new PgAdapter(getConnectionString(serviceName));
+      const cloud = new PgAdapterAsync(getConnectionString(serviceName));
 
       let tables: string[];
       if (opts.tables) {
         tables = opts.tables.split(",").map((t: string) => t.trim());
       } else {
-        const rows = cloud.all(
-          `SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename`
-        );
-        tables = rows.map((r: any) => r.tablename);
+        tables = await listPgTables(cloud);
       }
 
-      const results = syncPull(local, cloud, {
+      const results = await syncPull(cloud, local, {
         tables,
         onProgress: (p) => {
           if (p.phase === "done") {
@@ -121,7 +118,7 @@ export function registerCloudCommands(
       });
 
       local.close();
-      cloud.close();
+      await cloud.close();
 
       const total = results.reduce((s, r) => s + r.rowsWritten, 0);
       console.log(`Done. ${total} rows pulled.`);

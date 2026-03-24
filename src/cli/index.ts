@@ -7,10 +7,10 @@ import {
   createDatabase,
   type CloudConfig,
 } from "../config.js";
-import { syncPush, syncPull, listSqliteTables } from "../sync.js";
+import { syncPush, syncPull, listSqliteTables, listPgTables } from "../sync.js";
 import { saveFeedback, sendFeedback } from "../feedback.js";
 import { migrateDotfile, getDataDir, getDbPath } from "../dotfile.js";
-import { SqliteAdapter, PgAdapter } from "../adapter.js";
+import { SqliteAdapter, PgAdapterAsync } from "../adapter.js";
 import { readFileSync } from "fs";
 import { join, dirname } from "path";
 
@@ -81,12 +81,12 @@ program
       console.log("\nChecking PostgreSQL connection...");
       try {
         const connStr = getConnectionString("postgres");
-        const pg = new PgAdapter(connStr);
-        const row = pg.get("SELECT 1 as ok");
+        const pg = new PgAdapterAsync(connStr);
+        const row = await pg.get("SELECT 1 as ok");
         if (row?.ok === 1) {
           console.log("PostgreSQL: connected");
         }
-        pg.close();
+        await pg.close();
       } catch (err: any) {
         console.log("PostgreSQL: connection failed —", err?.message);
       }
@@ -104,7 +104,7 @@ syncCmd
   .description("Push local data to cloud")
   .requiredOption("--service <name>", "Service name")
   .option("--tables <tables>", "Comma-separated table names (default: all)")
-  .action((opts) => {
+  .action(async (opts) => {
     const config = getCloudConfig();
     if (config.mode === "local") {
       console.error(
@@ -132,9 +132,9 @@ syncCmd
     console.log(`Pushing ${tables.length} table(s) to cloud...`);
 
     const connStr = getConnectionString(opts.service);
-    const cloud = new PgAdapter(connStr);
+    const cloud = new PgAdapterAsync(connStr);
 
-    const results = syncPush(local, cloud, {
+    const results = await syncPush(local, cloud, {
       tables,
       onProgress: (p) => {
         if (p.phase === "done") {
@@ -146,7 +146,7 @@ syncCmd
     });
 
     local.close();
-    cloud.close();
+    await cloud.close();
 
     const totalWritten = results.reduce((s, r) => s + r.rowsWritten, 0);
     const totalErrors = results.reduce((s, r) => s + r.errors.length, 0);
@@ -170,7 +170,7 @@ syncCmd
   .description("Pull cloud data to local")
   .requiredOption("--service <name>", "Service name")
   .option("--tables <tables>", "Comma-separated table names (default: all)")
-  .action((opts) => {
+  .action(async (opts) => {
     const config = getCloudConfig();
     if (config.mode === "local") {
       console.error(
@@ -183,7 +183,7 @@ syncCmd
     const local = new SqliteAdapter(dbPath);
 
     const connStr = getConnectionString(opts.service);
-    const cloud = new PgAdapter(connStr);
+    const cloud = new PgAdapterAsync(connStr);
 
     let tables: string[];
     if (opts.tables) {
@@ -191,14 +191,11 @@ syncCmd
     } else {
       // For pull, list PG tables
       try {
-        const rows = cloud.all(
-          `SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename`
-        );
-        tables = rows.map((r: any) => r.tablename);
+        tables = await listPgTables(cloud);
       } catch {
         console.error("Failed to list tables from cloud.");
         local.close();
-        cloud.close();
+        await cloud.close();
         process.exit(1);
         return;
       }
@@ -207,13 +204,13 @@ syncCmd
     if (tables.length === 0) {
       console.log("No tables found to sync.");
       local.close();
-      cloud.close();
+      await cloud.close();
       return;
     }
 
     console.log(`Pulling ${tables.length} table(s) from cloud...`);
 
-    const results = syncPull(local, cloud, {
+    const results = await syncPull(cloud, local, {
       tables,
       onProgress: (p) => {
         if (p.phase === "done") {
@@ -225,7 +222,7 @@ syncCmd
     });
 
     local.close();
-    cloud.close();
+    await cloud.close();
 
     const totalWritten = results.reduce((s, r) => s + r.rowsWritten, 0);
     const totalErrors = results.reduce((s, r) => s + r.errors.length, 0);

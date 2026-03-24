@@ -5,10 +5,10 @@ import {
   getConnectionString,
   createDatabase,
 } from "./config.js";
-import { syncPush, syncPull, listSqliteTables } from "./sync.js";
+import { syncPush, syncPull, listSqliteTables, listPgTables } from "./sync.js";
 import { sendFeedback } from "./feedback.js";
 import { getDbPath } from "./dotfile.js";
-import { SqliteAdapter, PgAdapter } from "./adapter.js";
+import { SqliteAdapter, PgAdapterAsync } from "./adapter.js";
 
 /**
  * Register cloud-related MCP tools onto an existing MCP server.
@@ -42,10 +42,10 @@ export function registerCloudTools(
 
       if (config.rds.host && config.rds.username) {
         try {
-          const pg = new PgAdapter(getConnectionString("postgres"));
-          pg.get("SELECT 1 as ok");
+          const pg = new PgAdapterAsync(getConnectionString("postgres"));
+          await pg.get("SELECT 1 as ok");
           lines.push("PostgreSQL: connected");
-          pg.close();
+          await pg.close();
         } catch (err: any) {
           lines.push(`PostgreSQL: failed — ${err?.message}`);
         }
@@ -77,14 +77,14 @@ export function registerCloudTools(
       }
 
       const local = new SqliteAdapter(getDbPath(serviceName));
-      const cloud = new PgAdapter(getConnectionString(serviceName));
+      const cloud = new PgAdapterAsync(getConnectionString(serviceName));
       const tableList = tablesStr
         ? tablesStr.split(",").map((t) => t.trim())
         : listSqliteTables(local);
 
-      const results = syncPush(local, cloud, { tables: tableList });
+      const results = await syncPush(local, cloud, { tables: tableList });
       local.close();
-      cloud.close();
+      await cloud.close();
 
       const total = results.reduce((s, r) => s + r.rowsWritten, 0);
       return {
@@ -115,20 +115,17 @@ export function registerCloudTools(
       }
 
       const local = new SqliteAdapter(getDbPath(serviceName));
-      const cloud = new PgAdapter(getConnectionString(serviceName));
+      const cloud = new PgAdapterAsync(getConnectionString(serviceName));
 
       let tableList: string[];
       if (tablesStr) {
         tableList = tablesStr.split(",").map((t) => t.trim());
       } else {
         try {
-          const rows = cloud.all(
-            `SELECT tablename FROM pg_tables WHERE schemaname = 'public'`
-          );
-          tableList = rows.map((r: any) => r.tablename);
+          tableList = await listPgTables(cloud);
         } catch {
           local.close();
-          cloud.close();
+          await cloud.close();
           return {
             content: [
               { type: "text", text: "Error: failed to list cloud tables." },
@@ -138,9 +135,9 @@ export function registerCloudTools(
         }
       }
 
-      const results = syncPull(local, cloud, { tables: tableList });
+      const results = await syncPull(cloud, local, { tables: tableList });
       local.close();
-      cloud.close();
+      await cloud.close();
 
       const total = results.reduce((s, r) => s + r.rowsWritten, 0);
       return {

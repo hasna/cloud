@@ -295,56 +295,133 @@ async function syncTransfer(
   } = options;
 
   const results: SyncResult[] = [];
+  const sqliteTarget = !isAsyncAdapter(target) ? target : null;
 
-  for (let i = 0; i < tables.length; i++) {
-    const table = tables[i];
-    const result: SyncResult = {
-      table,
-      rowsRead: 0,
-      rowsWritten: 0,
-      rowsSkipped: 0,
-      errors: [],
-    };
+  // Disable FK checks on SQLite target to prevent constraint errors during sync.
+  // Uses exec() for reliable PRAGMA execution and wraps the entire operation in
+  // try/finally to guarantee FKs are re-enabled even if sync throws.
+  if (sqliteTarget) {
+    try { sqliteTarget.exec("PRAGMA foreign_keys = OFF"); } catch {}
+  }
 
-    try {
-      // Notify: reading
-      onProgress?.({
+  try {
+    for (let i = 0; i < tables.length; i++) {
+      const table = tables[i];
+      const result: SyncResult = {
         table,
-        phase: "reading",
         rowsRead: 0,
         rowsWritten: 0,
-        totalTables: tables.length,
-        currentTableIndex: i,
-      });
+        rowsSkipped: 0,
+        errors: [],
+      };
 
-      // Read all rows from source (may be sync DbAdapter or async PgAdapterAsync)
-      const rows = await readAll(source, `SELECT * FROM "${table}"`);
-      result.rowsRead = rows.length;
-
-      if (rows.length === 0) {
+      try {
+        // Notify: reading
         onProgress?.({
           table,
-          phase: "done",
+          phase: "reading",
           rowsRead: 0,
           rowsWritten: 0,
           totalTables: tables.length,
           currentTableIndex: i,
         });
-        results.push(result);
-        continue;
-      }
 
-      // Detect primary key columns for this table
-      const pkColumns = await resolvePrimaryKeys(source, target, table, pkOption);
+        // Read all rows from source (may be sync DbAdapter or async PgAdapterAsync)
+        const rows = await readAll(source, `SELECT * FROM "${table}"`);
+        result.rowsRead = rows.length;
 
-      // Get column names from the first row
-      const columns = Object.keys(rows[0]);
+        if (rows.length === 0) {
+          onProgress?.({
+            table,
+            phase: "done",
+            rowsRead: 0,
+            rowsWritten: 0,
+            totalTables: tables.length,
+            currentTableIndex: i,
+          });
+          results.push(result);
+          continue;
+        }
 
-      if (pkColumns.length === 0) {
-        // No PK found — insert without conflict handling (with warning)
-        result.errors.push(
-          `Table "${table}" has no primary key — inserting without conflict handling`
-        );
+        // Detect primary key columns for this table
+        const pkColumns = await resolvePrimaryKeys(source, target, table, pkOption);
+
+        // Get column names from the first row
+        const sourceColumns = Object.keys(rows[0]);
+
+        // Filter out columns that don't exist in the target table
+        let targetColumns: Set<string> | null = null;
+        if (!isAsyncAdapter(target)) {
+          try {
+            const colInfo: Array<{ name: string }> = target.all(`PRAGMA table_info("${table}")`);
+            targetColumns = new Set(colInfo.map((c) => c.name));
+          } catch {}
+        } else {
+          try {
+            const colInfo: Array<{ column_name: string }> = await target.all(
+              `SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = '${table}'`
+            );
+            targetColumns = new Set(colInfo.map((c) => c.column_name));
+          } catch {}
+        }
+
+        const columns = targetColumns
+          ? sourceColumns.filter((c) => targetColumns!.has(c))
+          : sourceColumns;
+
+        if (pkColumns.length === 0) {
+          // No PK found — insert without conflict handling (with warning)
+          result.errors.push(
+            `Table "${table}" has no primary key — inserting without conflict handling`
+          );
+
+          // Notify: writing
+          onProgress?.({
+            table,
+            phase: "writing",
+            rowsRead: result.rowsRead,
+            rowsWritten: 0,
+            totalTables: tables.length,
+            currentTableIndex: i,
+          });
+
+          for (let offset = 0; offset < rows.length; offset += batchSize) {
+            const batch = rows.slice(offset, offset + batchSize);
+            try {
+              if (isAsyncAdapter(target)) {
+                await batchInsertPg(target, table, columns, batch);
+              } else {
+                batchInsertSqlite(target, table, columns, batch);
+              }
+              result.rowsWritten += batch.length;
+            } catch (err: any) {
+              result.errors.push(
+                `Batch at offset ${offset}: ${err?.message ?? String(err)}`
+              );
+            }
+          }
+
+          onProgress?.({
+            table,
+            phase: "done",
+            rowsRead: result.rowsRead,
+            rowsWritten: result.rowsWritten,
+            totalTables: tables.length,
+            currentTableIndex: i,
+          });
+          results.push(result);
+          continue;
+        }
+
+        // Verify all PK columns exist in the data
+        const missingPks = pkColumns.filter((pk) => !columns.includes(pk));
+        if (missingPks.length > 0) {
+          result.errors.push(
+            `Table "${table}" missing PK columns in data: ${missingPks.join(", ")} — skipping`
+          );
+          results.push(result);
+          continue;
+        }
 
         // Notify: writing
         onProgress?.({
@@ -356,13 +433,19 @@ async function syncTransfer(
           currentTableIndex: i,
         });
 
+        // Process in batches using UPSERT
+        const updateCols = columns.filter((c) => !pkColumns.includes(c));
+
         for (let offset = 0; offset < rows.length; offset += batchSize) {
           const batch = rows.slice(offset, offset + batchSize);
+
           try {
             if (isAsyncAdapter(target)) {
-              await batchInsertPg(target, table, columns, batch);
+              // Target is PgAdapterAsync — use PG batch UPSERT
+              await batchUpsertPg(target, table, columns, updateCols, pkColumns, batch);
             } else {
-              batchInsertSqlite(target, table, columns, batch);
+              // Target is sync DbAdapter (SQLite) — use SQLite upsert
+              batchUpsertSqlite(target, table, columns, updateCols, pkColumns, batch);
             }
             result.rowsWritten += batch.length;
           } catch (err: any) {
@@ -370,8 +453,19 @@ async function syncTransfer(
               `Batch at offset ${offset}: ${err?.message ?? String(err)}`
             );
           }
+
+          // Progress update after each batch
+          onProgress?.({
+            table,
+            phase: "writing",
+            rowsRead: result.rowsRead,
+            rowsWritten: result.rowsWritten,
+            totalTables: tables.length,
+            currentTableIndex: i,
+          });
         }
 
+        // Done with this table
         onProgress?.({
           table,
           phase: "done",
@@ -380,76 +474,31 @@ async function syncTransfer(
           totalTables: tables.length,
           currentTableIndex: i,
         });
-        results.push(result);
-        continue;
+      } catch (err: any) {
+        result.errors.push(`Table "${table}": ${err?.message ?? String(err)}`);
       }
 
-      // Verify all PK columns exist in the data
-      const missingPks = pkColumns.filter((pk) => !columns.includes(pk));
-      if (missingPks.length > 0) {
-        result.errors.push(
-          `Table "${table}" missing PK columns in data: ${missingPks.join(", ")} — skipping`
-        );
-        results.push(result);
-        continue;
-      }
-
-      // Notify: writing
-      onProgress?.({
-        table,
-        phase: "writing",
-        rowsRead: result.rowsRead,
-        rowsWritten: 0,
-        totalTables: tables.length,
-        currentTableIndex: i,
-      });
-
-      // Process in batches using UPSERT
-      const updateCols = columns.filter((c) => !pkColumns.includes(c));
-
-      for (let offset = 0; offset < rows.length; offset += batchSize) {
-        const batch = rows.slice(offset, offset + batchSize);
-
-        try {
-          if (isAsyncAdapter(target)) {
-            // Target is PgAdapterAsync — use PG batch UPSERT
-            await batchUpsertPg(target, table, columns, updateCols, pkColumns, batch);
-          } else {
-            // Target is sync DbAdapter (SQLite) — use SQLite upsert
-            batchUpsertSqlite(target, table, columns, updateCols, pkColumns, batch);
-          }
-          result.rowsWritten += batch.length;
-        } catch (err: any) {
-          result.errors.push(
-            `Batch at offset ${offset}: ${err?.message ?? String(err)}`
-          );
-        }
-
-        // Progress update after each batch
-        onProgress?.({
-          table,
-          phase: "writing",
-          rowsRead: result.rowsRead,
-          rowsWritten: result.rowsWritten,
-          totalTables: tables.length,
-          currentTableIndex: i,
-        });
-      }
-
-      // Done with this table
-      onProgress?.({
-        table,
-        phase: "done",
-        rowsRead: result.rowsRead,
-        rowsWritten: result.rowsWritten,
-        totalTables: tables.length,
-        currentTableIndex: i,
-      });
-    } catch (err: any) {
-      result.errors.push(`Table "${table}": ${err?.message ?? String(err)}`);
+      results.push(result);
     }
+  } finally {
+    // Re-enable FK checks on SQLite target after sync, even if sync threw
+    if (sqliteTarget) {
+      try { sqliteTarget.exec("PRAGMA foreign_keys = ON"); } catch {}
 
-    results.push(result);
+      // Run FK integrity check and report violations
+      try {
+        const violations: Array<{ table: string; rowid: number; parent: string; fkid: number }> =
+          sqliteTarget.all("PRAGMA foreign_key_check");
+        if (violations.length > 0) {
+          const tables = [...new Set(violations.map((v) => v.table))];
+          const msg = `FK integrity check: ${violations.length} violation(s) in table(s): ${tables.join(", ")}`;
+          // Attach the warning to the last result or create a synthetic one
+          if (results.length > 0) {
+            results[results.length - 1].errors.push(msg);
+          }
+        }
+      } catch {}
+    }
   }
 
   return results;
@@ -536,8 +585,8 @@ function batchUpsertSqlite(
   const sql = `INSERT INTO "${table}" (${colList}) VALUES ${valuePlaceholders}
     ON CONFLICT (${pkList}) DO UPDATE SET ${setClause}`;
 
-  // Flatten params
-  const params = batch.flatMap((row) => columns.map((c) => row[c] ?? null));
+  // Flatten params — coerce PG types to SQLite-compatible values
+  const params = batch.flatMap((row) => columns.map((c) => coerceForSqlite(row[c])));
 
   target.run(sql, ...params);
 }
@@ -584,9 +633,29 @@ function batchInsertSqlite(
     .join(", ");
 
   const sql = `INSERT INTO "${table}" (${colList}) VALUES ${valuePlaceholders}`;
-  const params = batch.flatMap((row) => columns.map((c) => row[c] ?? null));
+  // Coerce PG types to SQLite-compatible values
+  const params = batch.flatMap((row) => columns.map((c) => coerceForSqlite(row[c])));
 
   target.run(sql, ...params);
+}
+
+// ---------------------------------------------------------------------------
+// Value coercion for SQLite
+// ---------------------------------------------------------------------------
+
+/**
+ * Coerce a value from PostgreSQL into a SQLite-compatible type.
+ * PG returns Date objects, JSON objects, arrays, etc. that bun:sqlite
+ * cannot bind. This converts them to strings/numbers/null.
+ */
+function coerceForSqlite(value: any): string | number | bigint | boolean | null | Uint8Array {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string" || typeof value === "number" || typeof value === "bigint" || typeof value === "boolean") return value;
+  if (value instanceof Date) return value.toISOString();
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array) return value as Uint8Array;
+  // Arrays, objects → JSON string
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
 }
 
 // ---------------------------------------------------------------------------

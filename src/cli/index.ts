@@ -23,8 +23,9 @@ import {
 } from "../scheduled-sync.js";
 import { discoverServices, isSyncExcludedTable } from "../discover.js";
 import { migrateService, migrateAllServices, ensurePgDatabase, ensureAllPgDatabases } from "../pg-migrate.js";
-import { readFileSync } from "fs";
+import { readFileSync, existsSync, statSync } from "fs";
 import { join, dirname } from "path";
+import { homedir } from "os";
 
 const program = new Command();
 
@@ -399,8 +400,6 @@ syncCmd
     const services = opts.service ? [opts.service] : discoverServices();
     const statuses: Array<{ service: string; localDb: string | null; localSize: string; tables: number; pgReachable: boolean }> = [];
 
-    const { existsSync, statSync } = require("fs");
-
     for (const service of services) {
       const dbPath = getDbPath(service);
       const localExists = existsSync(dbPath);
@@ -613,6 +612,98 @@ program
         console.log(`  ${f}`);
       }
     }
+  });
+
+// ---------------------------------------------------------------------------
+// cloud doctor
+// ---------------------------------------------------------------------------
+
+program
+  .command("doctor")
+  .description("Comprehensive health check for cloud sync setup")
+  .action(async () => {
+    const checks: Array<{ name: string; status: "pass" | "fail" | "warn"; detail: string }> = [];
+
+    // 1. Config file
+    const configPath = join(homedir(), ".hasna", "cloud", "config.json");
+    if (existsSync(configPath)) {
+      checks.push({ name: "Config file", status: "pass", detail: configPath });
+    } else {
+      checks.push({ name: "Config file", status: "fail", detail: "Missing. Run `cloud setup`." });
+    }
+
+    // 2. Mode
+    const config = getCloudConfig();
+    if (config.mode === "hybrid" || config.mode === "cloud") {
+      checks.push({ name: "Sync mode", status: "pass", detail: config.mode });
+    } else {
+      checks.push({ name: "Sync mode", status: "fail", detail: `"${config.mode}" — sync disabled. Run \`cloud setup --mode hybrid\`.` });
+    }
+
+    // 3. RDS host configured
+    if (config.rds.host) {
+      checks.push({ name: "RDS host", status: "pass", detail: config.rds.host });
+    } else {
+      checks.push({ name: "RDS host", status: "fail", detail: "Not configured. Run `cloud setup`." });
+    }
+
+    // 4. RDS password
+    const password = process.env[config.rds.password_env];
+    if (password) {
+      checks.push({ name: "RDS password", status: "pass", detail: `${config.rds.password_env} is set` });
+    } else {
+      checks.push({ name: "RDS password", status: "fail", detail: `${config.rds.password_env} not in environment. Add to ~/.secrets/hasna/rds/live.env` });
+    }
+
+    // 5. PG connection
+    if (config.rds.host && password) {
+      try {
+        const connStr = getConnectionString("postgres");
+        const pg = new PgAdapterAsync(connStr);
+        await pg.all("SELECT 1");
+        await pg.close();
+        checks.push({ name: "PG connection", status: "pass", detail: "Connected" });
+      } catch (err: any) {
+        checks.push({ name: "PG connection", status: "fail", detail: err?.message ?? String(err) });
+      }
+    } else {
+      checks.push({ name: "PG connection", status: "fail", detail: "Skipped — missing host or password" });
+    }
+
+    // 6. SSL CA cert
+    const caPath = process.env.NODE_EXTRA_CA_CERTS;
+    if (caPath && existsSync(caPath)) {
+      checks.push({ name: "SSL CA cert", status: "pass", detail: caPath });
+    } else if (caPath) {
+      checks.push({ name: "SSL CA cert", status: "warn", detail: `NODE_EXTRA_CA_CERTS set but file missing: ${caPath}` });
+    } else {
+      checks.push({ name: "SSL CA cert", status: "warn", detail: "NODE_EXTRA_CA_CERTS not set. May cause SSL errors on some systems." });
+    }
+
+    // 7. Services with local data
+    const services = discoverServices();
+    checks.push({ name: "Local services", status: services.length > 0 ? "pass" : "warn", detail: `${services.length} found in ~/.hasna/` });
+
+    // 8. Sync schedule
+    const schedule = getSyncScheduleStatus();
+    if (schedule.registered) {
+      checks.push({ name: "Sync schedule", status: "pass", detail: `Every ${schedule.schedule_minutes}m (${schedule.mechanism})` });
+    } else {
+      checks.push({ name: "Sync schedule", status: "warn", detail: "Not configured. Run `cloud sync schedule --every 30m`." });
+    }
+
+    // Print results
+    console.log("Cloud Doctor\n");
+    for (const c of checks) {
+      const icon = c.status === "pass" ? "✓" : c.status === "fail" ? "✗" : "⚠";
+      console.log(`  ${icon} ${c.name.padEnd(20)} ${c.detail}`);
+    }
+
+    const fails = checks.filter(c => c.status === "fail").length;
+    const warns = checks.filter(c => c.status === "warn").length;
+    console.log(`\n${checks.length} checks: ${checks.length - fails - warns} passed, ${warns} warnings, ${fails} failed`);
+
+    if (fails > 0) process.exit(1);
   });
 
 // ---------------------------------------------------------------------------

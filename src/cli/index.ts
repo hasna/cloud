@@ -387,6 +387,80 @@ program
   });
 
 // ---------------------------------------------------------------------------
+// cloud sync status
+// ---------------------------------------------------------------------------
+
+syncCmd
+  .command("status")
+  .description("Show sync status for all discovered services")
+  .option("--service <name>", "Show status for a single service")
+  .option("--json", "Output as JSON")
+  .action(async (opts) => {
+    const services = opts.service ? [opts.service] : discoverServices();
+    const statuses: Array<{ service: string; localDb: string | null; localSize: string; tables: number; pgReachable: boolean }> = [];
+
+    const { existsSync, statSync } = require("fs");
+
+    for (const service of services) {
+      const dbPath = getDbPath(service);
+      const localExists = existsSync(dbPath);
+      let localSize = "—";
+      let tableCount = 0;
+
+      if (localExists) {
+        try {
+          const stat = statSync(dbPath);
+          localSize = stat.size > 1024 * 1024
+            ? `${(stat.size / 1024 / 1024).toFixed(1)}MB`
+            : `${(stat.size / 1024).toFixed(0)}KB`;
+        } catch {}
+
+        try {
+          const local = new SqliteAdapter(dbPath);
+          const tables = listSqliteTables(local);
+          tableCount = tables.length;
+          local.close();
+        } catch {}
+      }
+
+      let pgReachable = false;
+      try {
+        const connStr = getConnectionString(service);
+        const pg = new PgAdapterAsync(connStr);
+        await pg.all("SELECT 1");
+        pgReachable = true;
+        await pg.close();
+      } catch {}
+
+      statuses.push({
+        service,
+        localDb: localExists ? dbPath : null,
+        localSize,
+        tables: tableCount,
+        pgReachable,
+      });
+    }
+
+    if (opts.json) {
+      console.log(JSON.stringify(statuses, null, 2));
+    } else {
+      const config = getCloudConfig();
+      console.log(`Mode: ${config.mode}`);
+      console.log(`Services: ${statuses.length}\n`);
+
+      for (const s of statuses) {
+        if (!s.localDb && !s.pgReachable) continue; // skip empty entries
+        const pgIcon = s.pgReachable ? "✓" : "✗";
+        console.log(`  ${s.service.padEnd(20)} ${s.localSize.padStart(8)}  ${String(s.tables).padStart(3)} tables  PG: ${pgIcon}`);
+      }
+
+      const withData = statuses.filter(s => s.localDb);
+      const pgOk = statuses.filter(s => s.pgReachable);
+      console.log(`\n${withData.length} with local data, ${pgOk.length} with PG connection`);
+    }
+  });
+
+// ---------------------------------------------------------------------------
 // cloud sync schedule
 // ---------------------------------------------------------------------------
 

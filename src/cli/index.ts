@@ -21,7 +21,7 @@ program
   .description(
     "Shared cloud infrastructure — database adapter, sync engine, feedback, dotfile migration"
   )
-  .version("0.1.0");
+  .version("0.1.7");
 
 // ---------------------------------------------------------------------------
 // cloud setup

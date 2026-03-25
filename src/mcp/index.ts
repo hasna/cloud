@@ -232,6 +232,118 @@ server.tool(
 );
 
 // ---------------------------------------------------------------------------
+// sync_all
+// ---------------------------------------------------------------------------
+
+server.tool(
+  "sync_all",
+  "Sync all discovered services between local and cloud. Pulls from PG to SQLite by default.",
+  {
+    direction: z.enum(["pull", "push"]).default("pull").describe("Sync direction"),
+  },
+  async ({ direction }) => {
+    const config = getCloudConfig();
+    if (config.mode === "local") {
+      return {
+        content: [{ type: "text", text: "Error: mode is 'local'. Configure cloud mode first via `cloud setup`." }],
+        isError: true,
+      };
+    }
+
+    const { discoverServices, isSyncExcludedTable } = await import("../discover.js");
+    const services = discoverServices();
+    const lines: string[] = [`Syncing ${services.length} services (${direction})...`];
+    let grandTotal = 0;
+    let grandErrors = 0;
+
+    for (const service of services) {
+      try {
+        const dbPath = getDbPath(service);
+        const local = new SqliteAdapter(dbPath);
+        const connStr = getConnectionString(service);
+        const cloud = new PgAdapterAsync(connStr);
+
+        let tableList: string[];
+        if (direction === "push") {
+          tableList = listSqliteTables(local).filter((t) => !isSyncExcludedTable(t));
+        } else {
+          try {
+            tableList = (await listPgTables(cloud)).filter((t) => !isSyncExcludedTable(t));
+          } catch {
+            local.close();
+            await cloud.close();
+            continue;
+          }
+        }
+
+        if (tableList.length === 0) {
+          local.close();
+          await cloud.close();
+          continue;
+        }
+
+        const results = direction === "push"
+          ? await syncPush(local, cloud, { tables: tableList })
+          : await syncPull(cloud, local, { tables: tableList });
+
+        local.close();
+        await cloud.close();
+
+        const written = results.reduce((s, r) => s + r.rowsWritten, 0);
+        const errors = results.reduce((s, r) => s + r.errors.length, 0);
+        grandTotal += written;
+        grandErrors += errors;
+
+        if (written > 0 || errors > 0) {
+          lines.push(`  ${service}: ${written} rows${errors > 0 ? `, ${errors} errors` : ""}`);
+        }
+      } catch (err: any) {
+        grandErrors++;
+        lines.push(`  ${service}: ERROR — ${err?.message ?? String(err)}`);
+      }
+    }
+
+    lines.push(`\nDone. ${services.length} services, ${grandTotal} rows, ${grandErrors} errors.`);
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// migrate_all
+// ---------------------------------------------------------------------------
+
+server.tool(
+  "migrate_all",
+  "Run PG migrations for all discovered services. Creates databases if needed.",
+  {},
+  async () => {
+    const { migrateAllServices, ensureAllPgDatabases } = await import("../pg-migrate.js");
+
+    const lines: string[] = ["Running PG migrations..."];
+
+    const dbResults = await ensureAllPgDatabases();
+    for (const r of dbResults) {
+      if (r.created) lines.push(`  Created DB: ${r.service}`);
+      if (r.error) lines.push(`  DB error: ${r.service} — ${r.error}`);
+    }
+
+    const results = await migrateAllServices();
+    let totalApplied = 0;
+
+    for (const r of results) {
+      totalApplied += r.applied.length;
+      if (r.applied.length > 0 || r.errors.length > 0) {
+        lines.push(`  ${r.service}: ${r.applied.length} applied${r.errors.length > 0 ? `, ${r.errors.length} errors` : ""}`);
+        for (const e of r.errors) lines.push(`    ${e}`);
+      }
+    }
+
+    lines.push(`\nDone. ${results.length} services, ${totalApplied} migrations applied.`);
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+);
+
+// ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
 

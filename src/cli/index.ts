@@ -21,6 +21,8 @@ import {
   runScheduledSync,
   discoverSyncableServices,
 } from "../scheduled-sync.js";
+import { discoverServices, isSyncExcludedTable } from "../discover.js";
+import { migrateService, migrateAllServices, ensurePgDatabase, ensureAllPgDatabases } from "../pg-migrate.js";
 import { readFileSync } from "fs";
 import { join, dirname } from "path";
 
@@ -112,7 +114,8 @@ const syncCmd = program.command("sync").description("Sync data between local and
 syncCmd
   .command("push")
   .description("Push local data to cloud")
-  .requiredOption("--service <name>", "Service name")
+  .option("--service <name>", "Service name")
+  .option("--all", "Push all discovered services")
   .option("--tables <tables>", "Comma-separated table names (default: all)")
   .action(async (opts) => {
     const config = getCloudConfig();
@@ -123,51 +126,87 @@ syncCmd
       process.exit(1);
     }
 
-    const dbPath = getDbPath(opts.service);
-    const local = new SqliteAdapter(dbPath);
-
-    let tables: string[];
-    if (opts.tables) {
-      tables = opts.tables.split(",").map((t: string) => t.trim());
-    } else {
-      tables = listSqliteTables(local);
+    if (!opts.service && !opts.all) {
+      console.error("Error: specify --service <name> or --all");
+      process.exit(1);
     }
 
-    if (tables.length === 0) {
-      console.log("No tables found to sync.");
+    const services = opts.all ? discoverServices() : [opts.service];
+    let grandTotalWritten = 0;
+    let grandTotalErrors = 0;
+
+    for (const service of services) {
+      const dbPath = getDbPath(service);
+      let local: SqliteAdapter;
+      try {
+        local = new SqliteAdapter(dbPath);
+      } catch {
+        if (opts.all) continue; // skip services without a local DB
+        console.error(`No local database found for service "${service}"`);
+        process.exit(1);
+        return;
+      }
+
+      let tables: string[];
+      if (opts.tables) {
+        tables = opts.tables.split(",").map((t: string) => t.trim());
+      } else {
+        tables = listSqliteTables(local).filter((t) => !isSyncExcludedTable(t));
+      }
+
+      if (tables.length === 0) {
+        local.close();
+        continue;
+      }
+
+      console.log(`[${service}] Pushing ${tables.length} table(s) to cloud...`);
+
+      let connStr: string;
+      try {
+        connStr = getConnectionString(service);
+      } catch (err: any) {
+        console.error(`  [${service}] ${err?.message ?? String(err)}`);
+        local.close();
+        grandTotalErrors++;
+        continue;
+      }
+      const cloud = new PgAdapterAsync(connStr);
+
+      const results = await syncPush(local, cloud, {
+        tables,
+        onProgress: (p) => {
+          if (p.phase === "done" && !opts.all) {
+            console.log(
+              `  [${p.currentTableIndex + 1}/${p.totalTables}] ${p.table}: ${p.rowsWritten} rows synced`
+            );
+          }
+        },
+      });
+
       local.close();
-      return;
-    }
+      await cloud.close();
 
-    console.log(`Pushing ${tables.length} table(s) to cloud...`);
+      const totalWritten = results.reduce((s, r) => s + r.rowsWritten, 0);
+      const totalErrors = results.reduce((s, r) => s + r.errors.length, 0);
+      grandTotalWritten += totalWritten;
+      grandTotalErrors += totalErrors;
 
-    const connStr = getConnectionString(opts.service);
-    const cloud = new PgAdapterAsync(connStr);
-
-    const results = await syncPush(local, cloud, {
-      tables,
-      onProgress: (p) => {
-        if (p.phase === "done") {
-          console.log(
-            `  [${p.currentTableIndex + 1}/${p.totalTables}] ${p.table}: ${p.rowsWritten} rows synced`
-          );
-        }
-      },
-    });
-
-    local.close();
-    await cloud.close();
-
-    const totalWritten = results.reduce((s, r) => s + r.rowsWritten, 0);
-    const totalErrors = results.reduce((s, r) => s + r.errors.length, 0);
-    console.log(`\nDone. ${totalWritten} rows pushed, ${totalErrors} errors.`);
-
-    if (totalErrors > 0) {
-      for (const r of results) {
-        for (const e of r.errors) {
-          console.error(`  ${r.table}: ${e}`);
+      if (opts.all) {
+        console.log(`  ${service}: ${totalWritten} rows pushed${totalErrors > 0 ? `, ${totalErrors} errors` : ""}`);
+      } else {
+        console.log(`\nDone. ${totalWritten} rows pushed, ${totalErrors} errors.`);
+        if (totalErrors > 0) {
+          for (const r of results) {
+            for (const e of r.errors) {
+              console.error(`  ${r.table}: ${e}`);
+            }
+          }
         }
       }
+    }
+
+    if (opts.all) {
+      console.log(`\nDone. ${services.length} services, ${grandTotalWritten} rows pushed, ${grandTotalErrors} errors.`);
     }
   });
 
@@ -178,7 +217,8 @@ syncCmd
 syncCmd
   .command("pull")
   .description("Pull cloud data to local")
-  .requiredOption("--service <name>", "Service name")
+  .option("--service <name>", "Service name")
+  .option("--all", "Pull all discovered services")
   .option("--tables <tables>", "Comma-separated table names (default: all)")
   .action(async (opts) => {
     const config = getCloudConfig();
@@ -189,60 +229,159 @@ syncCmd
       process.exit(1);
     }
 
-    const dbPath = getDbPath(opts.service);
-    const local = new SqliteAdapter(dbPath);
+    if (!opts.service && !opts.all) {
+      console.error("Error: specify --service <name> or --all");
+      process.exit(1);
+    }
 
-    const connStr = getConnectionString(opts.service);
-    const cloud = new PgAdapterAsync(connStr);
+    const services = opts.all ? discoverServices() : [opts.service];
+    let grandTotalWritten = 0;
+    let grandTotalErrors = 0;
 
-    let tables: string[];
-    if (opts.tables) {
-      tables = opts.tables.split(",").map((t: string) => t.trim());
-    } else {
-      // For pull, list PG tables
+    for (const service of services) {
+      const dbPath = getDbPath(service);
+      let local: SqliteAdapter;
       try {
-        tables = await listPgTables(cloud);
+        local = new SqliteAdapter(dbPath);
       } catch {
-        console.error("Failed to list tables from cloud.");
-        local.close();
-        await cloud.close();
+        if (opts.all) continue;
+        console.error(`No local database found for service "${service}"`);
         process.exit(1);
         return;
       }
-    }
 
-    if (tables.length === 0) {
-      console.log("No tables found to sync.");
+      let connStr: string;
+      try {
+        connStr = getConnectionString(service);
+      } catch (err: any) {
+        console.error(`  [${service}] ${err?.message ?? String(err)}`);
+        local.close();
+        grandTotalErrors++;
+        continue;
+      }
+      const cloud = new PgAdapterAsync(connStr);
+
+      let tables: string[];
+      if (opts.tables) {
+        tables = opts.tables.split(",").map((t: string) => t.trim());
+      } else {
+        try {
+          tables = (await listPgTables(cloud)).filter((t) => !isSyncExcludedTable(t));
+        } catch {
+          if (!opts.all) console.error(`Failed to list tables from cloud for "${service}".`);
+          local.close();
+          await cloud.close();
+          if (!opts.all) { process.exit(1); return; }
+          grandTotalErrors++;
+          continue;
+        }
+      }
+
+      if (tables.length === 0) {
+        local.close();
+        await cloud.close();
+        continue;
+      }
+
+      if (!opts.all) console.log(`Pulling ${tables.length} table(s) from cloud...`);
+
+      const results = await syncPull(cloud, local, {
+        tables,
+        onProgress: (p) => {
+          if (p.phase === "done" && !opts.all) {
+            console.log(
+              `  [${p.currentTableIndex + 1}/${p.totalTables}] ${p.table}: ${p.rowsWritten} rows synced`
+            );
+          }
+        },
+      });
+
       local.close();
       await cloud.close();
-      return;
+
+      const totalWritten = results.reduce((s, r) => s + r.rowsWritten, 0);
+      const totalErrors = results.reduce((s, r) => s + r.errors.length, 0);
+      grandTotalWritten += totalWritten;
+      grandTotalErrors += totalErrors;
+
+      if (opts.all) {
+        if (totalWritten > 0 || totalErrors > 0) {
+          console.log(`  ${service}: ${totalWritten} rows pulled${totalErrors > 0 ? `, ${totalErrors} errors` : ""}`);
+        }
+      } else {
+        console.log(`\nDone. ${totalWritten} rows pulled, ${totalErrors} errors.`);
+        if (totalErrors > 0) {
+          for (const r of results) {
+            for (const e of r.errors) {
+              console.error(`  ${r.table}: ${e}`);
+            }
+          }
+        }
+      }
     }
 
-    console.log(`Pulling ${tables.length} table(s) from cloud...`);
+    if (opts.all) {
+      console.log(`\nDone. ${services.length} services, ${grandTotalWritten} rows pulled, ${grandTotalErrors} errors.`);
+    }
+  });
 
-    const results = await syncPull(cloud, local, {
-      tables,
-      onProgress: (p) => {
-        if (p.phase === "done") {
-          console.log(
-            `  [${p.currentTableIndex + 1}/${p.totalTables}] ${p.table}: ${p.rowsWritten} rows synced`
-          );
+// ---------------------------------------------------------------------------
+// cloud migrate-pg
+// ---------------------------------------------------------------------------
+
+program
+  .command("migrate-pg")
+  .description("Apply PG migrations for services")
+  .option("--service <name>", "Service name")
+  .option("--all", "Migrate all discovered services")
+  .option("--create-db", "Create PG databases if they don't exist (default: true)", true)
+  .action(async (opts) => {
+    if (!opts.service && !opts.all) {
+      console.error("Error: specify --service <name> or --all");
+      process.exit(1);
+    }
+
+    if (opts.all) {
+      if (opts.createDb) {
+        console.log("Ensuring PG databases exist...");
+        const dbResults = await ensureAllPgDatabases();
+        for (const r of dbResults) {
+          if (r.created) console.log(`  Created database: ${r.service}`);
+          if (r.error) console.error(`  ${r.service}: ${r.error}`);
         }
-      },
-    });
+      }
 
-    local.close();
-    await cloud.close();
+      console.log("\nRunning PG migrations...");
+      const results = await migrateAllServices();
+      let totalApplied = 0;
+      let totalErrors = 0;
 
-    const totalWritten = results.reduce((s, r) => s + r.rowsWritten, 0);
-    const totalErrors = results.reduce((s, r) => s + r.errors.length, 0);
-    console.log(`\nDone. ${totalWritten} rows pulled, ${totalErrors} errors.`);
-
-    if (totalErrors > 0) {
       for (const r of results) {
-        for (const e of r.errors) {
-          console.error(`  ${r.table}: ${e}`);
+        totalApplied += r.applied.length;
+        totalErrors += r.errors.length;
+        if (r.applied.length > 0 || r.errors.length > 0) {
+          console.log(`  ${r.service}: ${r.applied.length} applied, ${r.alreadyApplied.length} existing${r.errors.length > 0 ? `, ${r.errors.length} errors` : ""}`);
+          for (const e of r.errors) {
+            console.error(`    ${e}`);
+          }
         }
+      }
+
+      console.log(`\nDone. ${results.length} services, ${totalApplied} migrations applied, ${totalErrors} errors.`);
+    } else {
+      if (opts.createDb) {
+        try {
+          const created = await ensurePgDatabase(opts.service);
+          if (created) console.log(`Created database: ${opts.service}`);
+        } catch (err: any) {
+          console.error(`Failed to create database: ${err?.message ?? String(err)}`);
+        }
+      }
+
+      const result = await migrateService(opts.service);
+      console.log(`${result.service}: ${result.applied.length} applied, ${result.alreadyApplied.length} existing`);
+      for (const e of result.errors) {
+        console.error(`  ${e}`);
       }
     }
   });

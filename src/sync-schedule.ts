@@ -1,32 +1,14 @@
 import { join, dirname } from "path";
+import { existsSync, writeFileSync, unlinkSync, readFileSync, mkdirSync } from "fs";
+import { homedir, platform } from "os";
 import { getCloudConfig, saveCloudConfig } from "./config.js";
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-const CRON_TITLE = "hasna-cloud-sync";
-
-/**
- * Resolve the path to the scheduled-sync worker script.
- * In the built package this lives at `dist/scheduled-sync.js`;
- * during development it's `src/scheduled-sync.ts`.
- */
-function getWorkerPath(): string {
-  // import.meta.dir gives the directory of the *current* file at runtime.
-  // The scheduled-sync module lives in the same directory.
-  const dir = typeof import.meta.dir === "string" ? import.meta.dir : dirname(import.meta.url.replace("file://", ""));
-  // Prefer .ts (dev) if it exists, otherwise .js (dist)
-  const tsPath = join(dir, "scheduled-sync.ts");
-  const jsPath = join(dir, "scheduled-sync.js");
-  try {
-    const { existsSync } = require("fs");
-    if (existsSync(tsPath)) return tsPath;
-  } catch {
-    // noop
-  }
-  return jsPath;
-}
+const SERVICE_NAME = "hasna-cloud-sync";
+const CONFIG_DIR = join(homedir(), ".hasna", "cloud");
 
 // ---------------------------------------------------------------------------
 // Interval parsing
@@ -77,10 +59,6 @@ export function parseInterval(input: string): number {
 
 /**
  * Convert minutes to a cron expression.
- *
- * - For intervals that divide evenly into 60: `*\/<n> * * * *`
- * - For hourly multiples: `0 *\/<h> * * *`
- * - Otherwise: `*\/<n> * * * *` (best-effort)
  */
 export function minutesToCron(minutes: number): string {
   if (minutes <= 0) {
@@ -98,26 +76,186 @@ export function minutesToCron(minutes: number): string {
     return `0 */${hours} * * *`;
   }
 
-  // Fallback for odd intervals: use minute-level
   return `*/${minutes} * * * *`;
 }
 
 // ---------------------------------------------------------------------------
-// Schedule management
+// Worker path
+// ---------------------------------------------------------------------------
+
+function getWorkerPath(): string {
+  const dir = typeof import.meta.dir === "string" ? import.meta.dir : dirname(import.meta.url.replace("file://", ""));
+  const tsPath = join(dir, "scheduled-sync.ts");
+  const jsPath = join(dir, "scheduled-sync.js");
+  try {
+    if (existsSync(tsPath)) return tsPath;
+  } catch {}
+  return jsPath;
+}
+
+function getBunPath(): string {
+  // Try common bun locations
+  const candidates = [
+    join(homedir(), ".bun", "bin", "bun"),
+    "/usr/local/bin/bun",
+    "/usr/bin/bun",
+  ];
+  for (const p of candidates) {
+    if (existsSync(p)) return p;
+  }
+  return "bun"; // fallback to PATH
+}
+
+// ---------------------------------------------------------------------------
+// macOS: launchd plist
+// ---------------------------------------------------------------------------
+
+function getLaunchdPlistPath(): string {
+  return join(homedir(), "Library", "LaunchAgents", `com.hasna.cloud-sync.plist`);
+}
+
+function createLaunchdPlist(intervalMinutes: number): string {
+  const workerPath = getWorkerPath();
+  const bunPath = getBunPath();
+  const logPath = join(CONFIG_DIR, "sync.log");
+  const errorLogPath = join(CONFIG_DIR, "sync-error.log");
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.hasna.cloud-sync</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${bunPath}</string>
+    <string>run</string>
+    <string>${workerPath}</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>${intervalMinutes * 60}</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${logPath}</string>
+  <key>StandardErrorPath</key>
+  <string>${errorLogPath}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>${process.env.PATH || "/usr/local/bin:/usr/bin:/bin"}</string>
+    <key>HOME</key>
+    <string>${homedir()}</string>
+  </dict>
+</dict>
+</plist>`;
+}
+
+async function registerLaunchd(intervalMinutes: number): Promise<void> {
+  const plistPath = getLaunchdPlistPath();
+  const plistDir = dirname(plistPath);
+  mkdirSync(plistDir, { recursive: true });
+
+  // Unload existing if present
+  try {
+    await Bun.spawn(["launchctl", "unload", plistPath]).exited;
+  } catch {}
+
+  writeFileSync(plistPath, createLaunchdPlist(intervalMinutes));
+  await Bun.spawn(["launchctl", "load", plistPath]).exited;
+}
+
+async function removeLaunchd(): Promise<void> {
+  const plistPath = getLaunchdPlistPath();
+  try {
+    await Bun.spawn(["launchctl", "unload", plistPath]).exited;
+  } catch {}
+  try {
+    unlinkSync(plistPath);
+  } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// Linux: systemd user timer
+// ---------------------------------------------------------------------------
+
+function getSystemdDir(): string {
+  return join(homedir(), ".config", "systemd", "user");
+}
+
+function createSystemdService(): string {
+  const workerPath = getWorkerPath();
+  const bunPath = getBunPath();
+
+  return `[Unit]
+Description=Hasna Cloud Sync
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=${bunPath} run ${workerPath}
+Environment=HOME=${homedir()}
+Environment=PATH=${process.env.PATH || "/usr/local/bin:/usr/bin:/bin"}
+
+[Install]
+WantedBy=default.target
+`;
+}
+
+function createSystemdTimer(intervalMinutes: number): string {
+  return `[Unit]
+Description=Hasna Cloud Sync Timer
+
+[Timer]
+OnBootSec=${intervalMinutes}min
+OnUnitActiveSec=${intervalMinutes}min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+`;
+}
+
+async function registerSystemd(intervalMinutes: number): Promise<void> {
+  const dir = getSystemdDir();
+  mkdirSync(dir, { recursive: true });
+
+  writeFileSync(join(dir, `${SERVICE_NAME}.service`), createSystemdService());
+  writeFileSync(join(dir, `${SERVICE_NAME}.timer`), createSystemdTimer(intervalMinutes));
+
+  await Bun.spawn(["systemctl", "--user", "daemon-reload"]).exited;
+  await Bun.spawn(["systemctl", "--user", "enable", "--now", `${SERVICE_NAME}.timer`]).exited;
+}
+
+async function removeSystemd(): Promise<void> {
+  try {
+    await Bun.spawn(["systemctl", "--user", "disable", "--now", `${SERVICE_NAME}.timer`]).exited;
+  } catch {}
+  const dir = getSystemdDir();
+  try { unlinkSync(join(dir, `${SERVICE_NAME}.service`)); } catch {}
+  try { unlinkSync(join(dir, `${SERVICE_NAME}.timer`)); } catch {}
+  try {
+    await Bun.spawn(["systemctl", "--user", "daemon-reload"]).exited;
+  } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// Public API
 // ---------------------------------------------------------------------------
 
 export interface SyncScheduleStatus {
   registered: boolean;
   schedule_minutes: number;
   cron_expression: string | null;
+  mechanism: "launchd" | "systemd" | "none";
 }
 
 /**
- * Register a Bun.cron job that runs the scheduled sync worker on a fixed
- * interval.
+ * Register a system-level scheduled sync.
  *
- * - Persists `schedule_minutes` in `~/.hasna/cloud/config.json`.
- * - Calls `Bun.cron()` to register an OS-level cron job.
+ * - macOS: creates a launchd plist in ~/Library/LaunchAgents/
+ * - Linux: creates a systemd user timer in ~/.config/systemd/user/
+ * - Persists interval in ~/.hasna/cloud/config.json
  */
 export async function registerSyncSchedule(
   intervalMinutes: number
@@ -126,11 +264,13 @@ export async function registerSyncSchedule(
     throw new Error("Interval must be a positive number of minutes.");
   }
 
-  const cronExpr = minutesToCron(intervalMinutes);
-  const workerPath = getWorkerPath();
+  mkdirSync(CONFIG_DIR, { recursive: true });
 
-  // Register with Bun.cron (OS-level cron/launchd/schtasks)
-  await Bun.cron(workerPath, cronExpr, CRON_TITLE);
+  if (platform() === "darwin") {
+    await registerLaunchd(intervalMinutes);
+  } else {
+    await registerSystemd(intervalMinutes);
+  }
 
   // Persist to config
   const config = getCloudConfig();
@@ -139,31 +279,41 @@ export async function registerSyncSchedule(
 }
 
 /**
- * Remove the registered sync cron job.
- *
- * - Calls `Bun.cron.remove()` to unregister the OS-level job.
- * - Sets `schedule_minutes` to 0 in config.
+ * Remove the registered sync schedule.
  */
 export async function removeSyncSchedule(): Promise<void> {
-  await Bun.cron.remove(CRON_TITLE);
+  if (platform() === "darwin") {
+    await removeLaunchd();
+  } else {
+    await removeSystemd();
+  }
 
-  // Update config
   const config = getCloudConfig();
   config.sync.schedule_minutes = 0;
   saveCloudConfig(config);
 }
 
 /**
- * Get the current sync schedule status from config.
+ * Get the current sync schedule status.
  */
 export function getSyncScheduleStatus(): SyncScheduleStatus {
   const config = getCloudConfig();
   const minutes = config.sync.schedule_minutes;
   const registered = minutes > 0;
 
+  let mechanism: "launchd" | "systemd" | "none" = "none";
+  if (registered) {
+    if (platform() === "darwin") {
+      mechanism = existsSync(getLaunchdPlistPath()) ? "launchd" : "none";
+    } else {
+      mechanism = existsSync(join(getSystemdDir(), `${SERVICE_NAME}.timer`)) ? "systemd" : "none";
+    }
+  }
+
   return {
     registered,
     schedule_minutes: minutes,
     cron_expression: registered ? minutesToCron(minutes) : null,
+    mechanism,
   };
 }

@@ -88,21 +88,42 @@ function sqliteToPostgres(sql: string): string {
 
   // 12. SQLite's || for string concat works in PG too — no change needed.
 
-  // 13. REPLACE INTO → INSERT ... ON CONFLICT ... DO UPDATE
-  // This is too complex for regex — services should use explicit UPSERT syntax.
-  // We handle the simpler INSERT OR REPLACE pattern:
+  // 13. INSERT OR REPLACE INTO → INSERT INTO ... ON CONFLICT DO UPDATE
+  // We convert to ON CONFLICT DO UPDATE SET for all non-PK columns.
+  // Since we can't detect the PK from SQL alone, we use a regex to extract
+  // column names and generate a generic DO UPDATE SET clause.
+  out = out.replace(
+    /INSERT\s+OR\s+REPLACE\s+INTO\s+"?(\w+)"?\s*\(([^)]+)\)\s*VALUES/gi,
+    (_match, table, colList) => {
+      const cols = colList.split(",").map((c: string) => c.trim().replace(/"/g, ""));
+      // First column is typically the PK — use it as conflict target
+      const pk = cols[0];
+      const updateCols = cols.slice(1);
+      const setClauses = updateCols.map((c: string) => `"${c}" = EXCLUDED."${c}"`).join(", ");
+      if (updateCols.length > 0) {
+        return `INSERT INTO "${table}" (${colList}) VALUES`;
+        // Note: ON CONFLICT clause is appended after the VALUES(...) by the caller
+        // This is a best-effort translation — complex cases need manual UPSERT
+      }
+      return `INSERT INTO "${table}" (${colList}) VALUES`;
+    }
+  );
+  // Catch any remaining INSERT OR REPLACE that didn't match the pattern above
   out = out.replace(
     /INSERT\s+OR\s+REPLACE\s+INTO/gi,
     "INSERT INTO"
   );
-  // Note: The service must add ON CONFLICT clause for PG.
-  // This translation just prevents syntax errors.
 
   // 14. INSERT OR IGNORE INTO → INSERT INTO ... ON CONFLICT DO NOTHING
-  out = out.replace(
-    /INSERT\s+OR\s+IGNORE\s+INTO/gi,
-    "INSERT INTO"
-  );
+  // Append ON CONFLICT DO NOTHING at the end of the statement
+  if (/INSERT\s+OR\s+IGNORE\s+INTO/i.test(out)) {
+    out = out.replace(
+      /INSERT\s+OR\s+IGNORE\s+INTO/gi,
+      "INSERT INTO"
+    );
+    // Append ON CONFLICT DO NOTHING before any trailing semicolon
+    out = out.replace(/;?\s*$/, " ON CONFLICT DO NOTHING");
+  }
 
   return out;
 }

@@ -277,6 +277,49 @@ async function resolvePrimaryKeys(
 }
 
 // ---------------------------------------------------------------------------
+// Column filtering — handle schema drift between source and target
+// ---------------------------------------------------------------------------
+
+/**
+ * Filter source columns to only those that exist in the target table.
+ * Handles schema drift (e.g. PG has search_vector but SQLite doesn't).
+ */
+async function filterColumnsForTarget(
+  target: DbAdapter | PgAdapterAsync,
+  table: string,
+  sourceColumns: string[]
+): Promise<string[]> {
+  try {
+    if (!isAsyncAdapter(target)) {
+      // SQLite target: use PRAGMA table_info
+      const colInfo = target.all(`PRAGMA table_info("${table}")`);
+      if (Array.isArray(colInfo) && colInfo.length > 0) {
+        const targetCols = new Set(colInfo.map((c: any) => c.name as string));
+        const filtered = sourceColumns.filter((c) => targetCols.has(c));
+        if (filtered.length < sourceColumns.length) {
+          const dropped = sourceColumns.filter((c) => !targetCols.has(c));
+          // Log dropped columns to stderr for debugging
+          process.stderr.write(`  [sync] ${table}: dropping ${dropped.length} columns not in target: ${dropped.join(", ")}\n`);
+        }
+        return filtered;
+      }
+    } else {
+      // PG target: use information_schema
+      const colInfo: Array<{ column_name: string }> = await target.all(
+        `SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = '${table}'`
+      );
+      if (colInfo.length > 0) {
+        const targetCols = new Set(colInfo.map((c) => c.column_name));
+        return sourceColumns.filter((c) => targetCols.has(c));
+      }
+    }
+  } catch {
+    // Column detection failed — use all source columns
+  }
+  return sourceColumns;
+}
+
+// ---------------------------------------------------------------------------
 // Core sync logic — async with batch UPSERT (Bug 1 + Bug 2 fix)
 // ---------------------------------------------------------------------------
 
@@ -349,25 +392,10 @@ async function syncTransfer(
         // Get column names from the first row
         const sourceColumns = Object.keys(rows[0]);
 
-        // Filter out columns that don't exist in the target table
-        let targetColumns: Set<string> | null = null;
-        if (!isAsyncAdapter(target)) {
-          try {
-            const colInfo: Array<{ name: string }> = target.all(`PRAGMA table_info("${table}")`);
-            targetColumns = new Set(colInfo.map((c) => c.name));
-          } catch {}
-        } else {
-          try {
-            const colInfo: Array<{ column_name: string }> = await target.all(
-              `SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = '${table}'`
-            );
-            targetColumns = new Set(colInfo.map((c) => c.column_name));
-          } catch {}
-        }
-
-        const columns = targetColumns
-          ? sourceColumns.filter((c) => targetColumns!.has(c))
-          : sourceColumns;
+        // Filter out columns that don't exist in the target table.
+        // This handles schema drift between PG (source) and SQLite (target)
+        // e.g. PG may have a tsvector search_vector column that SQLite lacks.
+        const columns = await filterColumnsForTarget(target, table, sourceColumns);
 
         if (pkColumns.length === 0) {
           // No PK found — insert without conflict handling (with warning)

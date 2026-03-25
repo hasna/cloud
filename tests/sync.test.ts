@@ -301,6 +301,201 @@ describe("sync (SQLite-to-SQLite)", () => {
   });
 });
 
+describe("sync — FK constraint handling", () => {
+  let source: SqliteAdapter;
+  let target: SqliteAdapter;
+
+  const DB_SRC_FK = join(tmpdir(), `cloud-test-fk-src-${Date.now()}.db`);
+  const DB_TGT_FK = join(tmpdir(), `cloud-test-fk-tgt-${Date.now()}.db`);
+
+  beforeEach(() => {
+    source = new SqliteAdapter(DB_SRC_FK);
+    target = new SqliteAdapter(DB_TGT_FK);
+
+    // Create parent + child tables with FK constraint in both
+    source.exec(`
+      CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT);
+      CREATE TABLE IF NOT EXISTS tasks (
+        id TEXT PRIMARY KEY,
+        project_id TEXT REFERENCES projects(id),
+        title TEXT
+      );
+    `);
+    target.exec(`
+      CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT);
+      CREATE TABLE IF NOT EXISTS tasks (
+        id TEXT PRIMARY KEY,
+        project_id TEXT REFERENCES projects(id),
+        title TEXT
+      );
+    `);
+  });
+
+  afterEach(() => {
+    source.close();
+    target.close();
+    for (const f of [DB_SRC_FK, DB_TGT_FK]) {
+      try { if (existsSync(f)) unlinkSync(f); } catch {}
+      try { if (existsSync(f + "-wal")) unlinkSync(f + "-wal"); } catch {}
+      try { if (existsSync(f + "-shm")) unlinkSync(f + "-shm"); } catch {}
+    }
+  });
+
+  test("syncPull succeeds with FK-dependent tables (FK disabled during sync)", async () => {
+    // Insert data in source with FK relationship
+    source.run("INSERT INTO projects (id, name) VALUES (?, ?)", "p1", "Project1");
+    source.run("INSERT INTO tasks (id, project_id, title) VALUES (?, ?, ?)", "t1", "p1", "Task1");
+
+    // Pull: tasks may arrive before projects if table ordering fails.
+    // The sync should disable FK checks so this doesn't error.
+    const results = await syncPull(source as any, target, {
+      tables: ["tasks", "projects"], // intentionally wrong order
+    });
+
+    const totalWritten = results.reduce((s, r) => s + r.rowsWritten, 0);
+    const totalErrors = results.reduce((s, r) => s + r.errors.length, 0);
+    expect(totalWritten).toBe(2);
+    expect(totalErrors).toBe(0);
+
+    const task = target.get("SELECT * FROM tasks WHERE id = ?", "t1");
+    expect(task.project_id).toBe("p1");
+  });
+
+  test("FK constraints are re-enabled after sync completes", async () => {
+    source.run("INSERT INTO projects (id, name) VALUES (?, ?)", "p1", "Project1");
+
+    await syncPull(source as any, target, { tables: ["projects"] });
+
+    // After sync, FK should be back on. Inserting a task with invalid FK should fail.
+    expect(() => {
+      target.run("INSERT INTO tasks (id, project_id, title) VALUES (?, ?, ?)", "t1", "nonexistent", "Bad");
+    }).toThrow();
+  });
+});
+
+describe("sync — column filtering (schema drift)", () => {
+  let source: SqliteAdapter;
+  let target: SqliteAdapter;
+
+  const DB_SRC_COL = join(tmpdir(), `cloud-test-col-src-${Date.now()}.db`);
+  const DB_TGT_COL = join(tmpdir(), `cloud-test-col-tgt-${Date.now()}.db`);
+
+  beforeEach(() => {
+    source = new SqliteAdapter(DB_SRC_COL);
+    target = new SqliteAdapter(DB_TGT_COL);
+  });
+
+  afterEach(() => {
+    source.close();
+    target.close();
+    for (const f of [DB_SRC_COL, DB_TGT_COL]) {
+      try { if (existsSync(f)) unlinkSync(f); } catch {}
+      try { if (existsSync(f + "-wal")) unlinkSync(f + "-wal"); } catch {}
+      try { if (existsSync(f + "-shm")) unlinkSync(f + "-shm"); } catch {}
+    }
+  });
+
+  test("syncPull drops columns that exist in source but not target", async () => {
+    // Source has extra columns that target doesn't
+    source.exec(`
+      CREATE TABLE items (
+        id TEXT PRIMARY KEY,
+        name TEXT,
+        search_vector TEXT,
+        extra_col TEXT
+      )
+    `);
+    target.exec(`
+      CREATE TABLE items (
+        id TEXT PRIMARY KEY,
+        name TEXT
+      )
+    `);
+
+    source.run("INSERT INTO items (id, name, search_vector, extra_col) VALUES (?, ?, ?, ?)",
+      "i1", "Alpha", "tsvector_data", "extra");
+
+    const results = await syncPull(source as any, target, { tables: ["items"] });
+    expect(results[0].rowsWritten).toBe(1);
+    expect(results[0].errors).toHaveLength(0);
+
+    const row = target.get("SELECT * FROM items WHERE id = ?", "i1");
+    expect(row.name).toBe("Alpha");
+    expect(row.search_vector).toBeUndefined();
+  });
+
+  test("syncPull works when source and target have identical schemas", async () => {
+    source.exec("CREATE TABLE items (id TEXT PRIMARY KEY, name TEXT)");
+    target.exec("CREATE TABLE items (id TEXT PRIMARY KEY, name TEXT)");
+
+    source.run("INSERT INTO items (id, name) VALUES (?, ?)", "i1", "Same");
+
+    const results = await syncPull(source as any, target, { tables: ["items"] });
+    expect(results[0].rowsWritten).toBe(1);
+    expect(results[0].errors).toHaveLength(0);
+  });
+});
+
+describe("sync — PG type coercion for SQLite", () => {
+  let source: SqliteAdapter;
+  let target: SqliteAdapter;
+
+  const DB_SRC_COERCE = join(tmpdir(), `cloud-test-coerce-src-${Date.now()}.db`);
+  const DB_TGT_COERCE = join(tmpdir(), `cloud-test-coerce-tgt-${Date.now()}.db`);
+
+  beforeEach(() => {
+    source = new SqliteAdapter(DB_SRC_COERCE);
+    target = new SqliteAdapter(DB_TGT_COERCE);
+
+    const schema = `
+      CREATE TABLE items (
+        id TEXT PRIMARY KEY,
+        data TEXT,
+        count INTEGER,
+        updated_at TEXT
+      )
+    `;
+    source.exec(schema);
+    target.exec(schema);
+  });
+
+  afterEach(() => {
+    source.close();
+    target.close();
+    for (const f of [DB_SRC_COERCE, DB_TGT_COERCE]) {
+      try { if (existsSync(f)) unlinkSync(f); } catch {}
+      try { if (existsSync(f + "-wal")) unlinkSync(f + "-wal"); } catch {}
+      try { if (existsSync(f + "-shm")) unlinkSync(f + "-shm"); } catch {}
+    }
+  });
+
+  test("syncPull handles JSON objects stored as strings", async () => {
+    // Simulate PG returning a JSON string for a TEXT column
+    source.run("INSERT INTO items (id, data, count) VALUES (?, ?, ?)",
+      "i1", JSON.stringify({ key: "value" }), 42);
+
+    const results = await syncPull(source as any, target, { tables: ["items"] });
+    expect(results[0].rowsWritten).toBe(1);
+    expect(results[0].errors).toHaveLength(0);
+
+    const row = target.get("SELECT * FROM items WHERE id = ?", "i1");
+    expect(JSON.parse(row.data)).toEqual({ key: "value" });
+  });
+
+  test("syncPull handles null values", async () => {
+    source.run("INSERT INTO items (id, data, count, updated_at) VALUES (?, ?, ?, ?)",
+      "i1", null, null, null);
+
+    const results = await syncPull(source as any, target, { tables: ["items"] });
+    expect(results[0].rowsWritten).toBe(1);
+    expect(results[0].errors).toHaveLength(0);
+
+    const row = target.get("SELECT * FROM items WHERE id = ?", "i1");
+    expect(row.data).toBeNull();
+    expect(row.count).toBeNull();
+  });
+});
+
 describe("listSqliteTables", () => {
   test("lists user tables", () => {
     const db = new SqliteAdapter(

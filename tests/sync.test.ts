@@ -115,7 +115,7 @@ describe("sync (SQLite-to-SQLite)", () => {
     expect(row.value).toBe(42);
   });
 
-  test("syncPush reports error for table without primary key column", async () => {
+  test("syncPush inserts rows for table without primary key (with warning)", async () => {
     source.exec(
       "CREATE TABLE IF NOT EXISTS nopk (data TEXT)"
     );
@@ -124,7 +124,12 @@ describe("sync (SQLite-to-SQLite)", () => {
 
     const results = await syncPush(source, target as any, { tables: ["nopk"] });
     expect(results[0].errors.length).toBeGreaterThan(0);
-    expect(results[0].errors[0]).toContain('no "id" column');
+    expect(results[0].errors[0]).toContain("no primary key");
+    // Rows should still be inserted (without conflict handling)
+    expect(results[0].rowsWritten).toBe(1);
+    const rows = target.all("SELECT * FROM nopk");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].data).toBe("hello");
   });
 
   test("syncPush handles empty table", async () => {
@@ -150,6 +155,129 @@ describe("sync (SQLite-to-SQLite)", () => {
     expect(calls).toContain("reading");
     expect(calls).toContain("writing");
     expect(calls).toContain("done");
+  });
+
+  test("syncPush handles composite primary keys", async () => {
+    // Create a table with composite PK (like task_tags)
+    const schema = `
+      CREATE TABLE IF NOT EXISTS task_tags (
+        task_id TEXT NOT NULL,
+        tag_id TEXT NOT NULL,
+        created_at TEXT DEFAULT (datetime('now')),
+        PRIMARY KEY (task_id, tag_id)
+      )
+    `;
+    source.exec(schema);
+    target.exec(schema);
+
+    source.run(
+      "INSERT INTO task_tags (task_id, tag_id) VALUES (?, ?)",
+      "t1",
+      "tag-a"
+    );
+    source.run(
+      "INSERT INTO task_tags (task_id, tag_id) VALUES (?, ?)",
+      "t1",
+      "tag-b"
+    );
+    source.run(
+      "INSERT INTO task_tags (task_id, tag_id) VALUES (?, ?)",
+      "t2",
+      "tag-a"
+    );
+
+    const results = await syncPush(source, target as any, {
+      tables: ["task_tags"],
+    });
+    expect(results).toHaveLength(1);
+    expect(results[0].rowsWritten).toBe(3);
+    expect(results[0].errors).toHaveLength(0);
+
+    const rows = target.all("SELECT * FROM task_tags ORDER BY task_id, tag_id");
+    expect(rows).toHaveLength(3);
+    expect(rows[0].task_id).toBe("t1");
+    expect(rows[0].tag_id).toBe("tag-a");
+    expect(rows[2].task_id).toBe("t2");
+    expect(rows[2].tag_id).toBe("tag-a");
+  });
+
+  test("syncPush upserts with composite primary keys (no duplicates)", async () => {
+    const schema = `
+      CREATE TABLE IF NOT EXISTS task_deps (
+        task_id TEXT NOT NULL,
+        depends_on TEXT NOT NULL,
+        dep_type TEXT DEFAULT 'blocks',
+        PRIMARY KEY (task_id, depends_on)
+      )
+    `;
+    source.exec(schema);
+    target.exec(schema);
+
+    // Pre-existing row in target
+    target.run(
+      "INSERT INTO task_deps (task_id, depends_on, dep_type) VALUES (?, ?, ?)",
+      "t1",
+      "t2",
+      "old-type"
+    );
+
+    // Source has updated version of same row + a new row
+    source.run(
+      "INSERT INTO task_deps (task_id, depends_on, dep_type) VALUES (?, ?, ?)",
+      "t1",
+      "t2",
+      "blocks"
+    );
+    source.run(
+      "INSERT INTO task_deps (task_id, depends_on, dep_type) VALUES (?, ?, ?)",
+      "t1",
+      "t3",
+      "requires"
+    );
+
+    const results = await syncPush(source, target as any, {
+      tables: ["task_deps"],
+    });
+    expect(results[0].rowsWritten).toBe(2);
+    expect(results[0].errors).toHaveLength(0);
+
+    const rows = target.all(
+      "SELECT * FROM task_deps ORDER BY task_id, depends_on"
+    );
+    expect(rows).toHaveLength(2);
+    // The upsert should have updated the existing row
+    expect(rows[0].dep_type).toBe("blocks");
+    expect(rows[1].dep_type).toBe("requires");
+  });
+
+  test("syncPull handles composite primary keys", async () => {
+    const schema = `
+      CREATE TABLE IF NOT EXISTS task_tags (
+        task_id TEXT NOT NULL,
+        tag_id TEXT NOT NULL,
+        PRIMARY KEY (task_id, tag_id)
+      )
+    `;
+    source.exec(schema);
+    target.exec(schema);
+
+    // target acts as "remote" for pull
+    target.run(
+      "INSERT INTO task_tags (task_id, tag_id) VALUES (?, ?)",
+      "t1",
+      "tag-x"
+    );
+
+    const results = await syncPull(target as any, source, {
+      tables: ["task_tags"],
+    });
+    expect(results[0].rowsWritten).toBe(1);
+    expect(results[0].errors).toHaveLength(0);
+
+    const rows = source.all("SELECT * FROM task_tags");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].task_id).toBe("t1");
+    expect(rows[0].tag_id).toBe("tag-x");
   });
 
   test("batch upsert handles multiple rows efficiently", async () => {

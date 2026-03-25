@@ -25,8 +25,12 @@ export interface SyncOptions {
   batchSize?: number;
   /** Conflict resolution column (default: "updated_at"). Newest wins. */
   conflictColumn?: string;
-  /** Primary key column name (default: "id"). */
-  primaryKey?: string;
+  /**
+   * Primary key column name(s). Can be a single column string or an array
+   * for composite primary keys (default: auto-detected from the database).
+   * If not provided and auto-detection fails, falls back to "id".
+   */
+  primaryKey?: string | string[];
 }
 
 export interface SyncResult {
@@ -183,6 +187,96 @@ function heuristicOrder(tables: string[]): string[] {
 }
 
 // ---------------------------------------------------------------------------
+// Primary key detection
+// ---------------------------------------------------------------------------
+
+/**
+ * Detect primary key columns for a table in a SQLite database.
+ * Uses PRAGMA table_info — columns with pk > 0 are PK columns.
+ */
+function getSqlitePrimaryKeys(
+  adapter: DbAdapter,
+  table: string
+): string[] {
+  try {
+    const cols: Array<{ name: string; pk: number }> = adapter.all(
+      `PRAGMA table_info("${table}")`
+    );
+    const pkCols = cols
+      .filter((c) => c.pk > 0)
+      .sort((a, b) => a.pk - b.pk)
+      .map((c) => c.name);
+    return pkCols;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Detect primary key columns for a table in a PostgreSQL database (async).
+ * Queries information_schema.key_column_usage for the PRIMARY KEY constraint.
+ */
+async function getPgPrimaryKeys(
+  adapter: PgAdapterAsync,
+  table: string
+): Promise<string[]> {
+  try {
+    const rows: Array<{ column_name: string; ordinal_position: number }> =
+      await adapter.all(`
+        SELECT kcu.column_name, kcu.ordinal_position
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+          ON tc.constraint_name = kcu.constraint_name
+          AND tc.table_schema = kcu.table_schema
+        WHERE tc.constraint_type = 'PRIMARY KEY'
+          AND tc.table_schema = 'public'
+          AND tc.table_name = '${table}'
+        ORDER BY kcu.ordinal_position
+      `);
+    return rows.map((r) => r.column_name);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Detect primary key columns for a table, auto-selecting the right method
+ * based on the adapter type.
+ */
+async function detectPrimaryKeys(
+  adapter: DbAdapter | PgAdapterAsync,
+  table: string
+): Promise<string[]> {
+  if (isAsyncAdapter(adapter)) {
+    return getPgPrimaryKeys(adapter, table);
+  }
+  return getSqlitePrimaryKeys(adapter, table);
+}
+
+/**
+ * Normalize a primaryKey option into an array of column names.
+ * If not provided, auto-detects from the source adapter.
+ */
+async function resolvePrimaryKeys(
+  source: DbAdapter | PgAdapterAsync,
+  target: DbAdapter | PgAdapterAsync,
+  table: string,
+  pkOption?: string | string[]
+): Promise<string[]> {
+  // If explicitly provided, normalize to array
+  if (pkOption) {
+    return Array.isArray(pkOption) ? pkOption : [pkOption];
+  }
+
+  // Auto-detect from source first, then target
+  let pks = await detectPrimaryKeys(source, table);
+  if (pks.length === 0) {
+    pks = await detectPrimaryKeys(target, table);
+  }
+  return pks;
+}
+
+// ---------------------------------------------------------------------------
 // Core sync logic — async with batch UPSERT (Bug 1 + Bug 2 fix)
 // ---------------------------------------------------------------------------
 
@@ -197,7 +291,7 @@ async function syncTransfer(
     onProgress,
     batchSize = 100,
     conflictColumn = "updated_at",
-    primaryKey = "id",
+    primaryKey: pkOption,
   } = options;
 
   const results: SyncResult[] = [];
@@ -240,13 +334,61 @@ async function syncTransfer(
         continue;
       }
 
+      // Detect primary key columns for this table
+      const pkColumns = await resolvePrimaryKeys(source, target, table, pkOption);
+
       // Get column names from the first row
       const columns = Object.keys(rows[0]);
-      const hasPrimaryKey = columns.includes(primaryKey);
 
-      if (!hasPrimaryKey) {
+      if (pkColumns.length === 0) {
+        // No PK found — insert without conflict handling (with warning)
         result.errors.push(
-          `Table "${table}" has no "${primaryKey}" column — skipping`
+          `Table "${table}" has no primary key — inserting without conflict handling`
+        );
+
+        // Notify: writing
+        onProgress?.({
+          table,
+          phase: "writing",
+          rowsRead: result.rowsRead,
+          rowsWritten: 0,
+          totalTables: tables.length,
+          currentTableIndex: i,
+        });
+
+        for (let offset = 0; offset < rows.length; offset += batchSize) {
+          const batch = rows.slice(offset, offset + batchSize);
+          try {
+            if (isAsyncAdapter(target)) {
+              await batchInsertPg(target, table, columns, batch);
+            } else {
+              batchInsertSqlite(target, table, columns, batch);
+            }
+            result.rowsWritten += batch.length;
+          } catch (err: any) {
+            result.errors.push(
+              `Batch at offset ${offset}: ${err?.message ?? String(err)}`
+            );
+          }
+        }
+
+        onProgress?.({
+          table,
+          phase: "done",
+          rowsRead: result.rowsRead,
+          rowsWritten: result.rowsWritten,
+          totalTables: tables.length,
+          currentTableIndex: i,
+        });
+        results.push(result);
+        continue;
+      }
+
+      // Verify all PK columns exist in the data
+      const missingPks = pkColumns.filter((pk) => !columns.includes(pk));
+      if (missingPks.length > 0) {
+        result.errors.push(
+          `Table "${table}" missing PK columns in data: ${missingPks.join(", ")} — skipping`
         );
         results.push(result);
         continue;
@@ -263,7 +405,7 @@ async function syncTransfer(
       });
 
       // Process in batches using UPSERT
-      const updateCols = columns.filter((c) => c !== primaryKey);
+      const updateCols = columns.filter((c) => !pkColumns.includes(c));
 
       for (let offset = 0; offset < rows.length; offset += batchSize) {
         const batch = rows.slice(offset, offset + batchSize);
@@ -271,10 +413,10 @@ async function syncTransfer(
         try {
           if (isAsyncAdapter(target)) {
             // Target is PgAdapterAsync — use PG batch UPSERT
-            await batchUpsertPg(target, table, columns, updateCols, primaryKey, batch);
+            await batchUpsertPg(target, table, columns, updateCols, pkColumns, batch);
           } else {
             // Target is sync DbAdapter (SQLite) — use SQLite upsert
-            batchUpsertSqlite(target, table, columns, updateCols, primaryKey, batch);
+            batchUpsertSqlite(target, table, columns, updateCols, pkColumns, batch);
           }
           result.rowsWritten += batch.length;
         } catch (err: any) {
@@ -320,13 +462,14 @@ async function syncTransfer(
 /**
  * Batch UPSERT into PostgreSQL using INSERT ... ON CONFLICT ... DO UPDATE.
  * Parameters use $1, $2, ... numbering.
+ * Supports composite primary keys.
  */
 async function batchUpsertPg(
   target: PgAdapterAsync,
   table: string,
   columns: string[],
   updateCols: string[],
-  primaryKey: string,
+  primaryKeys: string[],
   batch: Record<string, any>[]
 ): Promise<void> {
   if (batch.length === 0) return;
@@ -341,14 +484,17 @@ async function batchUpsertPg(
     })
     .join(", ");
 
+  // Build ON CONFLICT clause with all PK columns
+  const pkList = primaryKeys.map((c) => `"${c}"`).join(", ");
+
   // Build SET clause for ON CONFLICT
   const setClause =
     updateCols.length > 0
       ? updateCols.map((c) => `"${c}" = EXCLUDED."${c}"`).join(", ")
-      : `"${primaryKey}" = EXCLUDED."${primaryKey}"`; // no-op update if only PK
+      : `"${primaryKeys[0]}" = EXCLUDED."${primaryKeys[0]}"`; // no-op update if only PK cols
 
   const sql = `INSERT INTO "${table}" (${colList}) VALUES ${valuePlaceholders}
-    ON CONFLICT ("${primaryKey}") DO UPDATE SET ${setClause}`;
+    ON CONFLICT (${pkList}) DO UPDATE SET ${setClause}`;
 
   // Flatten params
   const params = batch.flatMap((row) => columns.map((c) => row[c] ?? null));
@@ -359,13 +505,14 @@ async function batchUpsertPg(
 /**
  * Batch UPSERT into SQLite using INSERT ... ON CONFLICT ... DO UPDATE.
  * Parameters use ? placeholders.
+ * Supports composite primary keys.
  */
 function batchUpsertSqlite(
   target: DbAdapter,
   table: string,
   columns: string[],
   updateCols: string[],
-  primaryKey: string,
+  primaryKeys: string[],
   batch: Record<string, any>[]
 ): void {
   if (batch.length === 0) return;
@@ -377,16 +524,66 @@ function batchUpsertSqlite(
     .map(() => `(${columns.map(() => "?").join(", ")})`)
     .join(", ");
 
+  // Build ON CONFLICT clause with all PK columns
+  const pkList = primaryKeys.map((c) => `"${c}"`).join(", ");
+
   // Build SET clause for ON CONFLICT
   const setClause =
     updateCols.length > 0
       ? updateCols.map((c) => `"${c}" = EXCLUDED."${c}"`).join(", ")
-      : `"${primaryKey}" = EXCLUDED."${primaryKey}"`;
+      : `"${primaryKeys[0]}" = EXCLUDED."${primaryKeys[0]}"`;
 
   const sql = `INSERT INTO "${table}" (${colList}) VALUES ${valuePlaceholders}
-    ON CONFLICT ("${primaryKey}") DO UPDATE SET ${setClause}`;
+    ON CONFLICT (${pkList}) DO UPDATE SET ${setClause}`;
 
   // Flatten params
+  const params = batch.flatMap((row) => columns.map((c) => row[c] ?? null));
+
+  target.run(sql, ...params);
+}
+
+/**
+ * Batch INSERT into PostgreSQL without conflict handling (for tables without PKs).
+ */
+async function batchInsertPg(
+  target: PgAdapterAsync,
+  table: string,
+  columns: string[],
+  batch: Record<string, any>[]
+): Promise<void> {
+  if (batch.length === 0) return;
+
+  const colList = columns.map((c) => `"${c}"`).join(", ");
+  const valuePlaceholders = batch
+    .map((_, rowIdx) => {
+      const offset = rowIdx * columns.length;
+      return `(${columns.map((_, colIdx) => `$${offset + colIdx + 1}`).join(", ")})`;
+    })
+    .join(", ");
+
+  const sql = `INSERT INTO "${table}" (${colList}) VALUES ${valuePlaceholders}`;
+  const params = batch.flatMap((row) => columns.map((c) => row[c] ?? null));
+
+  await target.run(sql, ...params);
+}
+
+/**
+ * Batch INSERT into SQLite without conflict handling (for tables without PKs).
+ */
+function batchInsertSqlite(
+  target: DbAdapter,
+  table: string,
+  columns: string[],
+  batch: Record<string, any>[]
+): void {
+  if (batch.length === 0) return;
+
+  const colList = columns.map((c) => `"${c}"`).join(", ");
+  const valuePlaceholders = batch
+    .map(() => `(${columns.map(() => "?").join(", ")})`)
+    .join(", ");
+
+  const sql = `INSERT INTO "${table}" (${colList}) VALUES ${valuePlaceholders}`;
   const params = batch.flatMap((row) => columns.map((c) => row[c] ?? null));
 
   target.run(sql, ...params);

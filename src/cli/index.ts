@@ -54,30 +54,129 @@ program
 
 program
   .command("setup")
-  .description("Configure cloud settings")
+  .description("Configure cloud settings — interactive wizard or flags")
   .option("--host <host>", "RDS hostname")
   .option("--port <port>", "RDS port", "5432")
   .option("--username <user>", "RDS username")
   .option("--password-env <env>", "Env var for RDS password", "HASNA_RDS_PASSWORD")
   .option("--ssl", "Enable SSL", true)
   .option("--no-ssl", "Disable SSL")
-  .option("--mode <mode>", "Mode: local, cloud, or hybrid", "local")
-  .option("--sync-interval <minutes>", "Auto-sync interval in minutes", "0")
-  .action((opts) => {
+  .option("--mode <mode>", "Mode: local, cloud, or hybrid")
+  .option("--schedule <interval>", "Sync schedule (e.g. 30m, 1h)")
+  .option("--migrate", "Run PG migrations after setup")
+  .option("--pull", "Pull data from cloud after setup")
+  .action(async (opts) => {
     const config = getCloudConfig();
+
+    // Auto-detect from existing secrets if no flags provided
+    const isAutoDetect = !opts.host && !opts.username;
+    if (isAutoDetect) {
+      // Try to detect from environment
+      const envHost = process.env.HASNA_RDS_HOST;
+      const envUser = process.env.HASNA_RDS_USERNAME;
+      if (envHost && !config.rds.host) {
+        config.rds.host = envHost;
+        console.log(`Auto-detected RDS host: ${envHost}`);
+      }
+      if (envUser && !config.rds.username) {
+        config.rds.username = envUser;
+        console.log(`Auto-detected RDS username: ${envUser}`);
+      }
+    }
 
     if (opts.host) config.rds.host = opts.host;
     if (opts.port) config.rds.port = parseInt(opts.port, 10);
     if (opts.username) config.rds.username = opts.username;
     if (opts.passwordEnv) config.rds.password_env = opts.passwordEnv;
     config.rds.ssl = opts.ssl;
-    if (opts.mode) config.mode = opts.mode as CloudConfig["mode"];
-    if (opts.syncInterval)
-      config.auto_sync_interval_minutes = parseInt(opts.syncInterval, 10);
+    if (opts.mode) {
+      config.mode = opts.mode as CloudConfig["mode"];
+    } else if (config.mode === "local" && config.rds.host) {
+      // Auto-upgrade to hybrid if host is configured
+      config.mode = "hybrid";
+      console.log("Mode set to: hybrid (auto-upgraded from local)");
+    }
 
     saveCloudConfig(config);
-    console.log("Cloud configuration saved.");
-    console.log(JSON.stringify(config, null, 2));
+    console.log("\n✓ Configuration saved\n");
+
+    // Validate connection
+    const password = process.env[config.rds.password_env];
+    if (!password) {
+      console.error(`✗ ${config.rds.password_env} not set in environment`);
+      console.error(`  Add it to ~/.secrets/hasna/rds/live.env and source it`);
+      return;
+    }
+
+    if (config.rds.host) {
+      process.stdout.write("Testing PG connection... ");
+      try {
+        const connStr = getConnectionString("postgres");
+        const pg = new PgAdapterAsync(connStr);
+        await pg.all("SELECT 1");
+        await pg.close();
+        console.log("✓ Connected\n");
+      } catch (err: any) {
+        console.log(`✗ Failed: ${err?.message ?? String(err)}`);
+        return;
+      }
+
+      // Create databases + run migrations
+      if (opts.migrate !== false) {
+        console.log("Creating databases & running migrations...");
+        const dbResults = await ensureAllPgDatabases();
+        const created = dbResults.filter(r => r.created);
+        if (created.length > 0) {
+          console.log(`  Created ${created.length} database(s): ${created.map(r => r.service).join(", ")}`);
+        }
+
+        const migResults = await migrateAllServices();
+        const applied = migResults.filter(r => r.applied.length > 0);
+        const totalApplied = migResults.reduce((s, r) => s + r.applied.length, 0);
+        if (totalApplied > 0) {
+          console.log(`  Applied ${totalApplied} migration(s) across ${applied.length} service(s)`);
+        } else {
+          console.log("  All migrations up to date");
+        }
+        console.log("");
+      }
+
+      // Set up sync schedule
+      if (opts.schedule) {
+        try {
+          const minutes = parseInterval(opts.schedule);
+          await registerSyncSchedule(minutes);
+          console.log(`✓ Sync scheduled every ${minutes}m\n`);
+        } catch (err: any) {
+          console.error(`✗ Schedule failed: ${err?.message}`);
+        }
+      }
+
+      // Pull data
+      if (opts.pull) {
+        console.log("Pulling data from cloud...");
+        const services = discoverServices();
+        for (const service of services) {
+          try {
+            const dbPath = getDbPath(service);
+            const local = new SqliteAdapter(dbPath);
+            const connStr = getConnectionString(service);
+            const cloud = new PgAdapterAsync(connStr);
+            const tables = (await listPgTables(cloud)).filter((t) => !isSyncExcludedTable(t));
+            if (tables.length > 0) {
+              const results = await syncPull(cloud, local, { tables });
+              const written = results.reduce((s, r) => s + r.rowsWritten, 0);
+              if (written > 0) console.log(`  ${service}: ${written} rows`);
+            }
+            local.close();
+            await cloud.close();
+          } catch {}
+        }
+        console.log("");
+      }
+    }
+
+    console.log("Setup complete. Run `cloud doctor` to verify everything.");
   });
 
 // ---------------------------------------------------------------------------

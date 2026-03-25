@@ -76,8 +76,7 @@ describe("auto-sync", () => {
     expect(typeof syncOnStop).toBe("function");
   });
 
-  test("syncOnStart returns null when mode is local (not sync-enabled)", () => {
-    // Default mode is "local", so auto-sync should be disabled
+  test("syncOnStart returns null when mode is local (not sync-enabled)", async () => {
     const mockServer = {};
     const { syncOnStart } = setupAutoSync(
       "test-service",
@@ -87,12 +86,11 @@ describe("auto-sync", () => {
       ["items"]
     );
 
-    const result = syncOnStart();
-    // In local mode, sync is not enabled so result should be null
+    const result = await syncOnStart();
     expect(result).toBeNull();
   });
 
-  test("syncOnStop returns null when mode is local (not sync-enabled)", () => {
+  test("syncOnStop returns null when mode is local (not sync-enabled)", async () => {
     const mockServer = {};
     const { syncOnStop } = setupAutoSync(
       "test-service",
@@ -102,7 +100,7 @@ describe("auto-sync", () => {
       ["items"]
     );
 
-    const result = syncOnStop();
+    const result = await syncOnStop();
     expect(result).toBeNull();
   });
 
@@ -132,7 +130,7 @@ describe("auto-sync", () => {
   // setupAutoSync — callback-style server
   // -----------------------------------------------------------------------
 
-  test("setupAutoSync hooks into callback-style server (onconnect/ondisconnect)", () => {
+  test("setupAutoSync hooks into callback-style server (onconnect/ondisconnect)", async () => {
     let connectCalled = false;
     let disconnectCalled = false;
 
@@ -144,8 +142,8 @@ describe("auto-sync", () => {
     setupAutoSync("test-service", mockServer, local, remote, ["items"]);
 
     // The original handlers should still work when called
-    mockServer.onconnect();
-    mockServer.ondisconnect();
+    await mockServer.onconnect();
+    await mockServer.ondisconnect();
 
     // Original callbacks should have been invoked (wrapped)
     expect(connectCalled).toBe(true);

@@ -2,8 +2,10 @@ import { existsSync, readFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import type { DbAdapter } from "./adapter.js";
-import { getCloudConfig } from "./config.js";
-import { incrementalSyncPush, incrementalSyncPull } from "./sync-incremental.js";
+import { PgAdapterAsync } from "./adapter.js";
+import { getCloudConfig, getConnectionString } from "./config.js";
+import { syncPush, syncPull, listSqliteTables, listPgTables } from "./sync.js";
+import { isSyncExcludedTable } from "./discover.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -17,7 +19,6 @@ export interface AutoSyncConfig {
 export interface AutoSyncContext {
   serviceName: string;
   local: DbAdapter;
-  remote: DbAdapter;
   tables: string[];
   config: AutoSyncConfig;
 }
@@ -42,10 +43,6 @@ const DEFAULT_AUTO_SYNC_CONFIG: AutoSyncConfig = {
   auto_sync_on_stop: true,
 };
 
-/**
- * Read auto-sync configuration from `~/.hasna/cloud/config.json`.
- * Falls back to defaults if the file does not exist or is malformed.
- */
 export function getAutoSyncConfig(): AutoSyncConfig {
   try {
     if (!existsSync(AUTO_SYNC_CONFIG_PATH)) {
@@ -68,18 +65,15 @@ export function getAutoSyncConfig(): AutoSyncConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Auto-sync execution
+// Auto-sync execution — async using PgAdapterAsync
 // ---------------------------------------------------------------------------
 
-/**
- * Execute an auto-sync pull (for start) or push (for stop).
- */
-function executeAutoSync(
+async function executeAutoSync(
   event: "start" | "stop",
+  serviceName: string,
   local: DbAdapter,
-  remote: DbAdapter,
   tables: string[]
-): AutoSyncResult {
+): Promise<AutoSyncResult> {
   const direction = event === "start" ? "pull" : "push";
   const result: AutoSyncResult = {
     event,
@@ -90,23 +84,39 @@ function executeAutoSync(
     errors: [],
   };
 
+  let remote: PgAdapterAsync | null = null;
   try {
-    const stats =
-      direction === "pull"
-        ? incrementalSyncPull(remote, local, tables)
-        : incrementalSyncPush(local, remote, tables);
+    const connStr = getConnectionString(serviceName);
+    remote = new PgAdapterAsync(connStr);
 
-    for (const s of stats) {
-      if (s.errors.length === 0) {
-        result.tables_synced++;
-      }
-      result.total_rows_synced += s.synced_rows;
-      result.errors.push(...s.errors);
+    const syncTables = tables.length > 0
+      ? tables.filter((t) => !isSyncExcludedTable(t))
+      : direction === "push"
+        ? listSqliteTables(local).filter((t) => !isSyncExcludedTable(t))
+        : (await listPgTables(remote)).filter((t) => !isSyncExcludedTable(t));
+
+    if (syncTables.length === 0) {
+      result.success = true;
+      return result;
+    }
+
+    const results = direction === "pull"
+      ? await syncPull(remote, local, { tables: syncTables })
+      : await syncPush(local, remote, { tables: syncTables });
+
+    for (const r of results) {
+      if (r.errors.length === 0) result.tables_synced++;
+      result.total_rows_synced += r.rowsWritten;
+      result.errors.push(...r.errors);
     }
 
     result.success = result.errors.length === 0;
   } catch (err: any) {
     result.errors.push(err?.message ?? String(err));
+  } finally {
+    if (remote) {
+      try { await remote.close(); } catch {}
+    }
   }
 
   return result;
@@ -116,7 +126,7 @@ function executeAutoSync(
 // Signal handling for auto-sync on stop
 // ---------------------------------------------------------------------------
 
-type CleanupFn = () => void;
+type CleanupFn = () => Promise<void> | void;
 const cleanupHandlers: CleanupFn[] = [];
 let signalHandlersInstalled = false;
 
@@ -124,28 +134,24 @@ function installSignalHandlers(): void {
   if (signalHandlersInstalled) return;
   signalHandlersInstalled = true;
 
-  const handleExit = () => {
+  const handleExit = async () => {
     for (const fn of cleanupHandlers) {
-      try {
-        fn();
-      } catch {
-        // Best-effort on shutdown
-      }
+      try { await fn(); } catch {}
     }
   };
 
-  process.on("SIGTERM", () => {
-    handleExit();
+  process.on("SIGTERM", async () => {
+    await handleExit();
     process.exit(0);
   });
 
-  process.on("SIGINT", () => {
-    handleExit();
+  process.on("SIGINT", async () => {
+    await handleExit();
     process.exit(0);
   });
 
-  process.on("beforeExit", () => {
-    handleExit();
+  process.on("beforeExit", async () => {
+    await handleExit();
   });
 }
 
@@ -153,30 +159,15 @@ function installSignalHandlers(): void {
 // setupAutoSync — hooks into MCP server lifecycle
 // ---------------------------------------------------------------------------
 
-/**
- * Set up auto-sync hooks for a service's MCP server.
- *
- * - On connect: if `auto_sync_on_start` and mode is `hybrid` or `cloud`,
- *   pull from cloud to local.
- * - On disconnect/SIGTERM: if `auto_sync_on_stop` and mode is `hybrid` or `cloud`,
- *   push from local to cloud.
- *
- * @param serviceName - The service identifier.
- * @param server - The MCP server instance (any object with `onconnect`/`ondisconnect` events).
- * @param local - The local database adapter.
- * @param remote - The remote database adapter.
- * @param tables - Tables to sync.
- * @returns An object with methods to manually trigger start/stop syncs.
- */
 export function setupAutoSync(
   serviceName: string,
   server: any,
   local: DbAdapter,
-  remote: DbAdapter,
+  remote: DbAdapter | PgAdapterAsync,
   tables: string[]
 ): {
-  syncOnStart: () => AutoSyncResult | null;
-  syncOnStop: () => AutoSyncResult | null;
+  syncOnStart: () => Promise<AutoSyncResult | null>;
+  syncOnStop: () => Promise<AutoSyncResult | null>;
   config: AutoSyncConfig;
 } {
   const config = getAutoSyncConfig();
@@ -184,70 +175,53 @@ export function setupAutoSync(
   const isSyncEnabled =
     cloudConfig.mode === "hybrid" || cloudConfig.mode === "cloud";
 
-  const syncOnStart = (): AutoSyncResult | null => {
+  const syncOnStart = async (): Promise<AutoSyncResult | null> => {
     if (!config.auto_sync_on_start || !isSyncEnabled) return null;
-    return executeAutoSync("start", local, remote, tables);
+    return executeAutoSync("start", serviceName, local, tables);
   };
 
-  const syncOnStop = (): AutoSyncResult | null => {
+  const syncOnStop = async (): Promise<AutoSyncResult | null> => {
     if (!config.auto_sync_on_stop || !isSyncEnabled) return null;
-    return executeAutoSync("stop", local, remote, tables);
+    return executeAutoSync("stop", serviceName, local, tables);
   };
 
-  // Hook into MCP server events if the server supports them
+  // Hook into MCP server events
   if (server && typeof server.onconnect === "function") {
     const origOnConnect = server.onconnect;
-    server.onconnect = (...args: any[]) => {
-      syncOnStart();
+    server.onconnect = async (...args: any[]) => {
+      await syncOnStart();
       return origOnConnect.apply(server, args);
     };
   } else if (server && typeof server.on === "function") {
-    // EventEmitter-style server
-    server.on("connect", () => {
-      syncOnStart();
-    });
+    server.on("connect", () => syncOnStart());
   }
 
   if (server && typeof server.ondisconnect === "function") {
     const origOnDisconnect = server.ondisconnect;
-    server.ondisconnect = (...args: any[]) => {
-      syncOnStop();
+    server.ondisconnect = async (...args: any[]) => {
+      await syncOnStop();
       return origOnDisconnect.apply(server, args);
     };
   } else if (server && typeof server.on === "function") {
-    server.on("disconnect", () => {
-      syncOnStop();
-    });
+    server.on("disconnect", () => syncOnStop());
   }
 
-  // Also hook into process signals for graceful shutdown sync
+  // Signal handlers for graceful shutdown
   installSignalHandlers();
-  cleanupHandlers.push(() => {
-    syncOnStop();
-  });
+  cleanupHandlers.push(async () => { await syncOnStop(); });
 
   return { syncOnStart, syncOnStop, config };
 }
 
 // ---------------------------------------------------------------------------
-// enableAutoSync — simplified helper for services
+// enableAutoSync — simplified helper
 // ---------------------------------------------------------------------------
 
-/**
- * Enable auto-sync for a service. Simplified entry point that services
- * can call with minimal configuration.
- *
- * @param serviceName - The service name (used for logging context).
- * @param mcpServer - The MCP server instance.
- * @param local - The local database adapter.
- * @param remote - The remote database adapter.
- * @param tables - Tables to sync on start/stop.
- */
 export function enableAutoSync(
   serviceName: string,
   mcpServer: any,
   local: DbAdapter,
-  remote: DbAdapter,
+  remote: DbAdapter | PgAdapterAsync,
   tables: string[]
 ): void {
   setupAutoSync(serviceName, mcpServer, local, remote, tables);

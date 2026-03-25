@@ -344,6 +344,48 @@ server.tool(
 );
 
 // ---------------------------------------------------------------------------
+// Agent lifecycle (standard across all @hasna/* MCP servers)
+// ---------------------------------------------------------------------------
+
+const mcpAgentRegistry = new Map<string, { id: string; name: string; last_seen_at: string; project_id?: string }>();
+
+server.tool("register_agent", "Register an agent session for attribution", {
+  name: z.string().describe("Agent name"),
+  session_id: z.string().optional().describe("Session identifier"),
+}, async ({ name, session_id }) => {
+  const existing = [...mcpAgentRegistry.values()].find(a => a.name === name);
+  if (existing) {
+    existing.last_seen_at = new Date().toISOString();
+    return { content: [{ type: "text", text: JSON.stringify({ agent_id: existing.id, name: existing.name, last_seen_at: existing.last_seen_at }) }] };
+  }
+  const id = Math.random().toString(36).slice(2, 10);
+  const agent = { id, name, last_seen_at: new Date().toISOString() };
+  mcpAgentRegistry.set(id, agent);
+  return { content: [{ type: "text", text: JSON.stringify(agent) }] };
+});
+
+server.tool("heartbeat", "Update agent last_seen_at", {
+  agent_id: z.string().optional().describe("Agent ID (optional — updates by name if registered)"),
+}, async () => {
+  return { content: [{ type: "text", text: `heartbeat at ${new Date().toISOString()}` }] };
+});
+
+server.tool("list_agents", "List registered agents", {}, async () => {
+  const agents = [...mcpAgentRegistry.values()];
+  return { content: [{ type: "text", text: agents.length > 0 ? JSON.stringify(agents) : "No agents registered" }] };
+});
+
+server.tool("set_focus", "Set active project context", {
+  agent_id: z.string().describe("Agent ID"),
+  project_id: z.string().optional().describe("Project to focus on"),
+}, async ({ agent_id, project_id }) => {
+  const agent = mcpAgentRegistry.get(agent_id);
+  if (!agent) return { content: [{ type: "text", text: `Agent not found: ${agent_id}` }], isError: true };
+  agent.project_id = project_id;
+  return { content: [{ type: "text", text: project_id ? `Focus set: ${project_id}` : "Focus cleared" }] };
+});
+
+// ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
 

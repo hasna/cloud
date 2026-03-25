@@ -277,6 +277,102 @@ async function resolvePrimaryKeys(
 }
 
 // ---------------------------------------------------------------------------
+// Schema-before-data — auto-create missing tables in target
+// ---------------------------------------------------------------------------
+
+/**
+ * Map PG column types to SQLite types.
+ */
+function pgTypeToSqlite(pgType: string): string {
+  const t = pgType.toLowerCase();
+  if (t.includes("int") || t === "bigint" || t === "smallint" || t === "serial" || t === "bigserial") return "INTEGER";
+  if (t.includes("bool")) return "INTEGER";
+  if (t.includes("float") || t.includes("double") || t === "real" || t === "numeric" || t === "decimal") return "REAL";
+  if (t === "bytea") return "BLOB";
+  // text, varchar, char, uuid, timestamp, json, jsonb, tsvector → TEXT
+  return "TEXT";
+}
+
+/**
+ * Ensure a table exists in the SQLite target by introspecting the PG source.
+ * Skips PG-only types like tsvector columns (they'll be filtered by column filtering later).
+ */
+async function ensureTableInSqliteFromPg(
+  target: DbAdapter,
+  source: PgAdapterAsync,
+  table: string
+): Promise<boolean> {
+  // Check if table already exists in SQLite
+  const existing = target.all(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table);
+  if (existing.length > 0) return false;
+
+  // Introspect PG schema
+  const cols: Array<{
+    column_name: string;
+    data_type: string;
+    is_nullable: string;
+    column_default: string | null;
+  }> = await source.all(
+    `SELECT column_name, data_type, is_nullable, column_default
+     FROM information_schema.columns
+     WHERE table_schema = 'public' AND table_name = '${table}'
+     ORDER BY ordinal_position`
+  );
+
+  if (cols.length === 0) return false;
+
+  // Get PK columns
+  const pkCols: Array<{ column_name: string }> = await source.all(
+    `SELECT kcu.column_name
+     FROM information_schema.table_constraints tc
+     JOIN information_schema.key_column_usage kcu
+       ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+     WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = 'public' AND tc.table_name = '${table}'
+     ORDER BY kcu.ordinal_position`
+  );
+  const pkSet = new Set(pkCols.map((c) => c.column_name));
+
+  // Skip PG-only columns (tsvector, etc.)
+  const skipTypes = new Set(["tsvector", "tsquery", "user-defined"]);
+  const filteredCols = cols.filter((c) => !skipTypes.has(c.data_type));
+
+  // Build CREATE TABLE
+  const colDefs = filteredCols.map((c) => {
+    const sqliteType = pgTypeToSqlite(c.data_type);
+    const notNull = c.is_nullable === "NO" && !pkSet.has(c.column_name) ? " NOT NULL" : "";
+    return `"${c.column_name}" ${sqliteType}${notNull}`;
+  });
+
+  // Add PRIMARY KEY constraint
+  if (pkSet.size > 0) {
+    const pkList = [...pkSet].map((c) => `"${c}"`).join(", ");
+    colDefs.push(`PRIMARY KEY (${pkList})`);
+  }
+
+  const sql = `CREATE TABLE IF NOT EXISTS "${table}" (${colDefs.join(", ")})`;
+  target.exec(sql);
+  process.stderr.write(`  [sync] ${table}: auto-created in SQLite from PG schema\n`);
+  return true;
+}
+
+/**
+ * Ensure all tables exist in the target before syncing data.
+ */
+async function ensureTablesExist(
+  source: DbAdapter | PgAdapterAsync,
+  target: DbAdapter | PgAdapterAsync,
+  tables: string[]
+): Promise<void> {
+  for (const table of tables) {
+    if (!isAsyncAdapter(target) && isAsyncAdapter(source)) {
+      // Pull: PG source → SQLite target
+      await ensureTableInSqliteFromPg(target, source, table);
+    }
+    // Push: SQLite source → PG target — handled by PG migrations, not auto-create
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Column filtering — handle schema drift between source and target
 // ---------------------------------------------------------------------------
 
@@ -339,6 +435,9 @@ async function syncTransfer(
 
   const results: SyncResult[] = [];
   const sqliteTarget = !isAsyncAdapter(target) ? target : null;
+
+  // Auto-create missing tables in target before syncing data
+  await ensureTablesExist(source, target, tables);
 
   // Disable FK checks on SQLite target to prevent constraint errors during sync.
   // Uses exec() for reliable PRAGMA execution and wraps the entire operation in

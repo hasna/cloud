@@ -11,6 +11,16 @@ import { syncPush, syncPull, listSqliteTables, listPgTables } from "../sync.js";
 import { saveFeedback, sendFeedback } from "../feedback.js";
 import { migrateDotfile, getDataDir, getDbPath } from "../dotfile.js";
 import { SqliteAdapter, PgAdapterAsync } from "../adapter.js";
+import {
+  registerSyncSchedule,
+  removeSyncSchedule,
+  getSyncScheduleStatus,
+  parseInterval,
+} from "../sync-schedule.js";
+import {
+  runScheduledSync,
+  discoverSyncableServices,
+} from "../scheduled-sync.js";
 import { readFileSync } from "fs";
 import { join, dirname } from "path";
 
@@ -21,7 +31,7 @@ program
   .description(
     "Shared cloud infrastructure — database adapter, sync engine, feedback, dotfile migration"
   )
-  .version("0.1.7");
+  .version("0.1.8");
 
 // ---------------------------------------------------------------------------
 // cloud setup
@@ -234,6 +244,104 @@ syncCmd
           console.error(`  ${r.table}: ${e}`);
         }
       }
+    }
+  });
+
+// ---------------------------------------------------------------------------
+// cloud sync schedule
+// ---------------------------------------------------------------------------
+
+syncCmd
+  .command("schedule")
+  .description("Manage scheduled background sync")
+  .option("--every <interval>", "Set sync interval (e.g. 5m, 10m, 1h)")
+  .option("--off", "Disable scheduled sync")
+  .option("--now", "Run a one-off sync immediately")
+  .action(async (opts) => {
+    // --off: remove schedule
+    if (opts.off) {
+      try {
+        await removeSyncSchedule();
+        console.log("Scheduled sync disabled.");
+      } catch (err: any) {
+        console.error("Failed to remove schedule:", err?.message);
+        process.exit(1);
+      }
+      return;
+    }
+
+    // --now: run sync immediately (one-shot)
+    if (opts.now) {
+      const config = getCloudConfig();
+      if (config.mode === "local") {
+        console.error(
+          "Error: mode is 'local'. Run `cloud setup --mode hybrid` or `--mode cloud` first."
+        );
+        process.exit(1);
+      }
+
+      console.log("Running sync now...");
+      const services = discoverSyncableServices();
+      console.log(`Discovered ${services.length} service(s): ${services.join(", ") || "(none)"}`);
+
+      const results = await runScheduledSync();
+      for (const r of results) {
+        const status = r.errors.length === 0 ? "ok" : "errors";
+        console.log(
+          `  ${r.service}: ${r.tables_synced} table(s), ${r.total_rows_synced} row(s) [${status}]`
+        );
+        for (const e of r.errors) {
+          console.error(`    ${e}`);
+        }
+      }
+
+      if (results.length === 0) {
+        console.log("No services synced (mode may be local or no databases found).");
+      } else {
+        const totalRows = results.reduce((s, r) => s + r.total_rows_synced, 0);
+        const totalErrors = results.reduce((s, r) => s + r.errors.length, 0);
+        console.log(`\nDone. ${totalRows} rows synced, ${totalErrors} errors.`);
+      }
+      return;
+    }
+
+    // --every: register schedule
+    if (opts.every) {
+      try {
+        const minutes = parseInterval(opts.every);
+        await registerSyncSchedule(minutes);
+        console.log(
+          `Scheduled sync registered: every ${minutes} minute(s).`
+        );
+      } catch (err: any) {
+        console.error("Failed to register schedule:", err?.message);
+        process.exit(1);
+      }
+      return;
+    }
+
+    // No flags: show current status
+    const status = getSyncScheduleStatus();
+    if (status.registered) {
+      console.log("Scheduled sync: enabled");
+      console.log(`  Interval: ${status.schedule_minutes} minute(s)`);
+      console.log(`  Cron expression: ${status.cron_expression}`);
+    } else {
+      console.log("Scheduled sync: disabled");
+      console.log(
+        "\nTo enable, run: cloud sync schedule --every 5m"
+      );
+    }
+
+    // Also show discoverable services
+    const services = discoverSyncableServices();
+    if (services.length > 0) {
+      console.log(`\nSyncable services (${services.length}):`);
+      for (const s of services) {
+        console.log(`  - ${s}`);
+      }
+    } else {
+      console.log("\nNo syncable services found (no .db files in ~/.hasna/).");
     }
   });
 

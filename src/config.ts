@@ -22,6 +22,11 @@ export const CloudConfigSchema = z.object({
   feedback_endpoint: z
     .string()
     .default("https://feedback.hasna.com/api/v1/feedback"),
+  sync: z
+    .object({
+      schedule_minutes: z.number().default(0),
+    })
+    .default({}),
 });
 
 export type CloudConfig = z.infer<typeof CloudConfigSchema>;

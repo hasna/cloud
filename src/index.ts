@@ -111,6 +111,23 @@ export {
   type AutoSyncResult,
 } from "./auto-sync.js";
 
+// Scheduled sync (Bun.cron background worker)
+export {
+  runScheduledSync,
+  discoverSyncableServices,
+  type ScheduledSyncResult,
+} from "./scheduled-sync.js";
+
+// Sync schedule management (register/remove/status)
+export {
+  registerSyncSchedule,
+  removeSyncSchedule,
+  getSyncScheduleStatus,
+  parseInterval,
+  minutesToCron,
+  type SyncScheduleStatus,
+} from "./sync-schedule.js";
+
 // Integration helpers (for services to embed cloud features)
 export { registerCloudTools } from "./mcp-helpers.js";
 export { registerCloudCommands } from "./cli-helpers.js";

@@ -39,7 +39,7 @@ describe("config", () => {
     }
 
     const config = getCloudConfig();
-    expect(config.mode).toBe("local");
+    expect(config.mode).toBe("hybrid");
     expect(config.rds.host).toBe("");
     expect(config.rds.port).toBe(5432);
     expect(config.rds.username).toBe("");
@@ -84,7 +84,7 @@ describe("config", () => {
 
     const config = getCloudConfig();
     // Should return defaults
-    expect(config.mode).toBe("local");
+    expect(config.mode).toBe("hybrid");
     expect(config.rds.host).toBe("");
   });
 });

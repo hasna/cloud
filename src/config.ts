@@ -17,7 +17,7 @@ export const CloudConfigSchema = z.object({
       ssl: z.boolean().default(true),
     })
     .default({}),
-  mode: z.enum(["local", "cloud", "hybrid"]).default("local"),
+  mode: z.enum(["local", "cloud", "hybrid"]).default("hybrid"),
   auto_sync_interval_minutes: z.number().default(0),
   feedback_endpoint: z
     .string()
@@ -81,7 +81,14 @@ export function getConnectionString(dbName: string): string {
     );
   }
 
-  const password = process.env[password_env] ?? "";
+  const password = process.env[password_env];
+  if (password === undefined || password === "") {
+    throw new Error(
+      `RDS password not set. Export ${password_env} in your shell or add it to ~/.secrets/hasna/rds/live.env`
+    );
+  }
+
+  // Use sslmode=require with rejectUnauthorized=false in adapter (RDS compatible)
   const sslParam = ssl ? "?sslmode=require" : "";
   return `postgres://${username}:${encodeURIComponent(password)}@${host}:${port}/${dbName}${sslParam}`;
 }

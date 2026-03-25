@@ -115,7 +115,10 @@ export class PgAdapter implements DbAdapter {
   constructor(pool: pg.Pool);
   constructor(arg: string | pg.Pool) {
     if (typeof arg === "string") {
-      this.pool = new pg.Pool({ connectionString: arg });
+      const sslConfig = arg.includes("sslmode=require") || arg.includes("ssl=true")
+        ? { rejectUnauthorized: false }
+        : undefined;
+      this.pool = new pg.Pool({ connectionString: arg, ssl: sslConfig });
     } else {
       this.pool = arg;
     }
@@ -282,7 +285,13 @@ export class PgAdapterAsync {
   constructor(pool: pg.Pool);
   constructor(arg: string | pg.Pool) {
     if (typeof arg === "string") {
-      this.pool = new pg.Pool({ connectionString: arg });
+      // For SSL connections (sslmode=require in connection string),
+      // use rejectUnauthorized=false for RDS compatibility.
+      // RDS uses Amazon's CA which may not be in the system trust store.
+      const sslConfig = arg.includes("sslmode=require") || arg.includes("ssl=true")
+        ? { rejectUnauthorized: false }
+        : undefined;
+      this.pool = new pg.Pool({ connectionString: arg, ssl: sslConfig });
     } else {
       this.pool = arg;
     }

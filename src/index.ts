@@ -128,6 +128,26 @@ export {
   type SyncScheduleStatus,
 } from "./sync-schedule.js";
 
+// PG migration runner
+export {
+  applyPgMigrations,
+  migrateService,
+  migrateAllServices,
+  ensurePgDatabase,
+  ensureAllPgDatabases,
+  type PgMigrationResult,
+} from "./pg-migrate.js";
+
+// Service discovery
+export {
+  discoverServices,
+  discoverSyncableServices as discoverSyncableServicesV2,
+  getServiceDbPath,
+  isSyncExcludedTable,
+  KNOWN_PG_SERVICES,
+  SYNC_EXCLUDED_TABLE_PATTERNS,
+} from "./discover.js";
+
 // Integration helpers (for services to embed cloud features)
 export { registerCloudTools } from "./mcp-helpers.js";
 export { registerCloudCommands } from "./cli-helpers.js";

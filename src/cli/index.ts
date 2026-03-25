@@ -29,6 +29,18 @@ import { homedir } from "os";
 
 const program = new Command();
 
+// Sync log helper — append to ~/.hasna/cloud/sync.log
+function logSync(direction: string, service: string, rows: number, errors: number): void {
+  try {
+    const logDir = join(homedir(), ".hasna", "cloud");
+    const logPath = join(logDir, "sync.log");
+    const { mkdirSync, appendFileSync } = require("fs");
+    mkdirSync(logDir, { recursive: true });
+    const ts = new Date().toISOString();
+    appendFileSync(logPath, `${ts} ${direction.padEnd(4)} ${service.padEnd(20)} ${rows} rows, ${errors} errors\n`);
+  } catch {}
+}
+
 program
   .name("cloud")
   .description(
@@ -118,6 +130,7 @@ syncCmd
   .option("--service <name>", "Service name")
   .option("--all", "Push all discovered services")
   .option("--tables <tables>", "Comma-separated table names (default: all)")
+  .option("--dry-run", "Preview what would be synced without executing")
   .action(async (opts) => {
     const config = getCloudConfig();
     if (config.mode === "local") {
@@ -160,6 +173,15 @@ syncCmd
         continue;
       }
 
+      if (opts.dryRun) {
+        const rowCounts = tables.map((t) => {
+          try { const r = local.get(`SELECT COUNT(*) as cnt FROM "${t}"`); return `${t}: ${r?.cnt ?? 0} rows`; } catch { return `${t}: ?`; }
+        });
+        console.log(`[${service}] Would push ${tables.length} table(s): ${rowCounts.join(", ")}`);
+        local.close();
+        continue;
+      }
+
       console.log(`[${service}] Pushing ${tables.length} table(s) to cloud...`);
 
       let connStr: string;
@@ -191,6 +213,7 @@ syncCmd
       const totalErrors = results.reduce((s, r) => s + r.errors.length, 0);
       grandTotalWritten += totalWritten;
       grandTotalErrors += totalErrors;
+      logSync("push", service, totalWritten, totalErrors);
 
       if (opts.all) {
         console.log(`  ${service}: ${totalWritten} rows pushed${totalErrors > 0 ? `, ${totalErrors} errors` : ""}`);
@@ -221,6 +244,7 @@ syncCmd
   .option("--service <name>", "Service name")
   .option("--all", "Pull all discovered services")
   .option("--tables <tables>", "Comma-separated table names (default: all)")
+  .option("--dry-run", "Preview what would be synced without executing")
   .action(async (opts) => {
     const config = getCloudConfig();
     if (config.mode === "local") {
@@ -284,6 +308,13 @@ syncCmd
         continue;
       }
 
+      if (opts.dryRun) {
+        console.log(`[${service}] Would pull ${tables.length} table(s): ${tables.join(", ")}`);
+        local.close();
+        await cloud.close();
+        continue;
+      }
+
       if (!opts.all) console.log(`Pulling ${tables.length} table(s) from cloud...`);
 
       const results = await syncPull(cloud, local, {
@@ -304,6 +335,7 @@ syncCmd
       const totalErrors = results.reduce((s, r) => s + r.errors.length, 0);
       grandTotalWritten += totalWritten;
       grandTotalErrors += totalErrors;
+      logSync("pull", service, totalWritten, totalErrors);
 
       if (opts.all) {
         if (totalWritten > 0 || totalErrors > 0) {

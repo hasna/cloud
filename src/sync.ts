@@ -569,10 +569,10 @@ async function syncTransfer(
           try {
             if (isAsyncAdapter(target)) {
               // Target is PgAdapterAsync — use PG batch UPSERT
-              await batchUpsertPg(target, table, columns, updateCols, pkColumns, batch);
+              await batchUpsertPg(target, table, columns, updateCols, pkColumns, batch, columns.includes(conflictColumn) ? conflictColumn : undefined);
             } else {
               // Target is sync DbAdapter (SQLite) — use SQLite upsert
-              batchUpsertSqlite(target, table, columns, updateCols, pkColumns, batch);
+              batchUpsertSqlite(target, table, columns, updateCols, pkColumns, batch, columns.includes(conflictColumn) ? conflictColumn : undefined);
             }
             result.rowsWritten += batch.length;
           } catch (err: any) {
@@ -646,7 +646,8 @@ async function batchUpsertPg(
   columns: string[],
   updateCols: string[],
   primaryKeys: string[],
-  batch: Record<string, any>[]
+  batch: Record<string, any>[],
+  conflictColumn?: string
 ): Promise<void> {
   if (batch.length === 0) return;
 
@@ -669,8 +670,14 @@ async function batchUpsertPg(
       ? updateCols.map((c) => `"${c}" = EXCLUDED."${c}"`).join(", ")
       : `"${primaryKeys[0]}" = EXCLUDED."${primaryKeys[0]}"`; // no-op update if only PK cols
 
+  // Add WHERE clause: only update if incoming row is newer (or target has no timestamp)
+  const whereClause =
+    conflictColumn && updateCols.includes(conflictColumn)
+      ? ` WHERE "${table}"."${conflictColumn}" IS NULL OR EXCLUDED."${conflictColumn}" >= "${table}"."${conflictColumn}"`
+      : "";
+
   const sql = `INSERT INTO "${table}" (${colList}) VALUES ${valuePlaceholders}
-    ON CONFLICT (${pkList}) DO UPDATE SET ${setClause}`;
+    ON CONFLICT (${pkList}) DO UPDATE SET ${setClause}${whereClause}`;
 
   // Flatten params
   const params = batch.flatMap((row) => columns.map((c) => row[c] ?? null));
@@ -689,7 +696,8 @@ function batchUpsertSqlite(
   columns: string[],
   updateCols: string[],
   primaryKeys: string[],
-  batch: Record<string, any>[]
+  batch: Record<string, any>[],
+  conflictColumn?: string
 ): void {
   if (batch.length === 0) return;
 
@@ -709,8 +717,14 @@ function batchUpsertSqlite(
       ? updateCols.map((c) => `"${c}" = EXCLUDED."${c}"`).join(", ")
       : `"${primaryKeys[0]}" = EXCLUDED."${primaryKeys[0]}"`;
 
+  // Add WHERE clause: only update if incoming row is newer (or target has no timestamp)
+  const whereClause =
+    conflictColumn && updateCols.includes(conflictColumn)
+      ? ` WHERE "${table}"."${conflictColumn}" IS NULL OR EXCLUDED."${conflictColumn}" >= "${table}"."${conflictColumn}"`
+      : "";
+
   const sql = `INSERT INTO "${table}" (${colList}) VALUES ${valuePlaceholders}
-    ON CONFLICT (${pkList}) DO UPDATE SET ${setClause}`;
+    ON CONFLICT (${pkList}) DO UPDATE SET ${setClause}${whereClause}`;
 
   // Flatten params — coerce PG types to SQLite-compatible values
   const params = batch.flatMap((row) => columns.map((c) => coerceForSqlite(row[c])));

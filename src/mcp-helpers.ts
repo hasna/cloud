@@ -14,18 +14,22 @@ import { SqliteAdapter, PgAdapterAsync } from "./adapter.js";
  * Register cloud-related MCP tools onto an existing MCP server.
  * Services call this to embed cloud sync/feedback tools into their own MCP server.
  *
+ * @param migrations - Optional list of SQL statements to run against PG before pushing.
+ *   Use this to ensure the cloud schema exists (CREATE TABLE IF NOT EXISTS ...).
+ *
  * @example
  * ```ts
  * import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
  * import { registerCloudTools } from "@hasna/cloud";
  *
  * const server = new McpServer({ name: "my-service", version: "0.1.0" });
- * registerCloudTools(server, "my-service");
+ * registerCloudTools(server, "my-service", { migrations: PG_MIGRATIONS });
  * ```
  */
 export function registerCloudTools(
   server: McpServer,
-  serviceName: string
+  serviceName: string,
+  opts: { migrations?: string[] } = {}
 ): void {
   // --- cloud_status ---
   server.tool(
@@ -78,6 +82,13 @@ export function registerCloudTools(
 
       const local = new SqliteAdapter(getDbPath(serviceName));
       const cloud = new PgAdapterAsync(getConnectionString(serviceName));
+
+      if (opts.migrations?.length) {
+        for (const sql of opts.migrations) {
+          await cloud.run(sql);
+        }
+      }
+
       const tableList = tablesStr
         ? tablesStr.split(",").map((t) => t.trim())
         : listSqliteTables(local);

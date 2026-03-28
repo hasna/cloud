@@ -29,7 +29,7 @@ import { SqliteAdapter, PgAdapterAsync } from "./adapter.js";
 export function registerCloudTools(
   server: McpServer,
   serviceName: string,
-  opts: { migrations?: string[] } = {}
+  opts: { migrations?: string[]; dbPath?: string } = {}
 ): void {
   // --- cloud_status ---
   server.tool(
@@ -80,7 +80,7 @@ export function registerCloudTools(
         };
       }
 
-      const local = new SqliteAdapter(getDbPath(serviceName));
+      const local = new SqliteAdapter(opts.dbPath ?? getDbPath(serviceName));
       const cloud = new PgAdapterAsync(getConnectionString(serviceName));
 
       if (opts.migrations?.length) {
@@ -125,7 +125,7 @@ export function registerCloudTools(
         };
       }
 
-      const local = new SqliteAdapter(getDbPath(serviceName));
+      const local = new SqliteAdapter(opts.dbPath ?? getDbPath(serviceName));
       const cloud = new PgAdapterAsync(getConnectionString(serviceName));
 
       let tableList: string[];
